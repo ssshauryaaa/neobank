@@ -1,9 +1,38 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "../../../lib/db";
 import { signToken } from "../../../lib/auth";
+import { logAttack, detectSqli } from "../../../lib/logAttack";
 
 export async function POST(req: NextRequest) {
   const { username, password } = await req.json();
+
+  const ip =
+    req.headers.get("x-forwarded-for") ??
+    req.headers.get("x-real-ip") ??
+    "unknown";
+
+  // ── SQLi detection on login form ──────────────────────────────────────────
+  const sqliInUsername = detectSqli(username ?? "");
+  const sqliInPassword = detectSqli(password ?? "");
+
+  if (sqliInUsername || sqliInPassword) {
+    // Fire-and-forget — never block the (vulnerable) login path
+    logAttack({
+      type: "sqli",
+      severity: "critical",
+      ip,
+      userId: null,
+      username: String(username),
+      detail: sqliInUsername
+        ? `SQL injection in username field: "${username}"`
+        : `SQL injection in password field: "${password}"`,
+      raw: {
+        username,
+        password,
+        field: sqliInUsername ? "username" : "password",
+      },
+    });
+  }
 
   try {
     const db = await getDb();
@@ -12,9 +41,6 @@ export async function POST(req: NextRequest) {
     // Exploit: username = ' OR '1'='1'--
     // Exploit: username = admin'--
     const query = `SELECT * FROM users WHERE username='${username}' AND password='${password}'`;
-
-    // console.log('[DEBUG INPUT]', { username, password });
-    // console.log('[DEBUG] Login query:', query); // intentionally logged
 
     const [rows]: any = await db.query(query);
 
@@ -26,6 +52,26 @@ export async function POST(req: NextRequest) {
     }
 
     const user = rows[0];
+
+    // ── If SQLi succeeded, log that we have a confirmed bypass ───────────────
+    if (sqliInUsername || sqliInPassword) {
+      logAttack({
+        type: "sqli",
+        severity: "critical",
+        ip,
+        userId: String(user.id),
+        username: String(user.username),
+        detail: `SQL injection login bypass SUCCEEDED — authenticated as user "${user.username}" (id=${user.id})`,
+        raw: {
+          injected_query: query,
+          authenticated_user: {
+            id: user.id,
+            username: user.username,
+            role: user.role,
+          },
+        },
+      });
+    }
 
     // 🔵 VULNERABLE: Weak JWT secret, no algorithm restriction, role trusted from DB
     const token = signToken({
@@ -48,17 +94,8 @@ export async function POST(req: NextRequest) {
       },
     });
 
-    // keep your vulnerable session cookie
-    res.cookies.set("session", String(user.id), {
-      path: "/",
-    });
-
-    // ✅ ADD THIS (so middleware can detect login)
-    res.cookies.set("token", token, {
-      path: "/",
-      // intentionally still insecure if you want CTF vibe
-      // httpOnly: false,
-    });
+    res.cookies.set("session", String(user.id), { path: "/" });
+    res.cookies.set("token", token, { path: "/" });
 
     return res;
   } catch (err: any) {
