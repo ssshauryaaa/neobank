@@ -1,0 +1,65 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=DM+Serif+Display&display=swap");
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+/* Light Mode (Default) */
+:root {
+    --bg-main: #f9f8f6;
+    --bg-card: #ffffff;
+    --text-main: #1a1a1a;
+    --text-sub: #70685c;
+    --text-desc: #8a7f6e;
+    --border-main: #edeae4;
+    --border-sub: #f5f3ef;
+    --toggle-on: #1a1a1a;
+    --toggle-off: #edeae4;
+}
+
+/* Dark Mode */
+.dark {
+    --bg-main: #111111;
+    --bg-card: #1a1a1a;
+    --text-main: #f3f4f6;
+    --text-sub: #9ca3af;
+    --text-desc: #6b7280;
+    --border-main: #2a2a2a;
+    --border-sub: #2a2a2a;
+    --toggle-on: #f3f4f6;
+    --toggle-off: #374151;
+}
+
+/* Apply base background and text color to the whole app */
+body {
+    background-color: var(--bg-main);
+    color: var(--text-main);
+    transition:
+        background-color 0.3s ease,
+        color 0.3s ease;
+}
+
+html,
+body {
+    background: #f8f7f4;
+    color: #1a1a1a;
+    font-family: "Inter", sans-serif;
+    -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar {
+    width: 4px;
+}
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+::-webkit-scrollbar-thumb {
+    background: #d4d0c8;
+    border-radius: 4px;
+}
