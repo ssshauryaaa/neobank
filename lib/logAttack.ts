@@ -1,29 +1,11 @@
-// lib/logAttack.ts
-// Drop this into any vulnerable API route to feed the Blue Team defense console.
-//
-// Usage example (in your /api/user route):
-//
-//   import { logAttack } from "../../../lib/logAttack";
-//
-//   // JWT forgery detection
-//   if (decodedPayload.role !== originalRole) {
-//     await logAttack({
-//       type: "jwt_forge",
-//       severity: "critical",
-//       ip: req.headers.get("x-forwarded-for") ?? "unknown",
-//       userId: String(userId),
-//       username: decodedPayload.username,
-//       detail: `JWT payload forged: role escalated to "${decodedPayload.role}"`,
-//       raw: { original: originalRole, forged: decodedPayload.role, token },
-//     });
-//   }
-
 export type AttackType =
   | "jwt_forge"
   | "sqli"
   | "idor"
   | "brute_force"
-  | "recon";
+  | "recon"
+  | "xss";
+
 export type Severity = "critical" | "high" | "medium" | "low";
 
 export type AttackPayload = {
@@ -43,20 +25,51 @@ export async function logAttack(payload: AttackPayload): Promise<void> {
       (typeof window === "undefined"
         ? "http://localhost:3000"
         : window.location.origin);
-
     await fetch(`${base}/api/defense/logs`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "ingest", ...payload }),
     });
   } catch {
-    // Never crash the main request because of logging
     console.error("[logAttack] Failed to ingest attack log");
   }
 }
 
 // ── Pattern detectors ──────────────────────────────────────────────────────
-// Call these from your route handlers.
+
+/**
+ * Detect SQL injection attempts in a string value.
+ *
+ * MySQL comment syntax quirk:
+ *   -- requires a trailing space to be treated as a comment.
+ *   So "admin'--" does NOT bypass auth, but "admin'-- " does.
+ *   We match both forms:
+ *     - "--" followed by whitespace or end-of-string (after trimming)
+ *     - the raw sequence "'--" anywhere (covers "admin'-- " when trimmed to "admin'--")
+ *   Also catches "#" which is MySQL's single-char comment alternative.
+ */
+export function detectSqli(value: string): boolean {
+  const patterns = [
+    // MySQL dash-dash comment — space required, but also match at end-of-trimmed-string
+    /--[\s]/, // "-- " with trailing space (the real exploit form)
+    /--$/, // "--" at end of string (after any trimming on caller side)
+    /#/, // MySQL alternate comment character
+    /'\s*--/, // quote followed by -- (catches admin'-- with or without trailing space)
+
+    // Classic injection payloads
+    /'\s*(or|and)\s*'?\d/i, // ' OR '1, ' AND 1
+    /'\s*or\s*'1'\s*=\s*'1/i, // ' OR '1'='1
+    /union\s+select/i, // UNION SELECT
+    /;\s*(drop|alter|insert|update|delete)/i,
+    /\/\*.*\*\//, // inline comment /**/
+    /xp_/i, // SQL Server xp_ procs
+    /information_schema/i, // schema enumeration
+    /sleep\s*\(/i, // time-based blind
+    /benchmark\s*\(/i, // MySQL time-based
+    /waitfor\s+delay/i, // MSSQL time-based
+  ];
+  return patterns.some((p) => p.test(value));
+}
 
 /** Detect JWT payload forgery — compare decoded token to DB truth */
 export function detectJwtForgery(
@@ -76,18 +89,4 @@ export function detectJwtForgery(
     };
   }
   return { forged: false, detail: "" };
-}
-
-/** Detect SQL injection attempts in a string value */
-export function detectSqli(value: string): boolean {
-  const patterns = [
-    /'\s*(or|and)\s*'?\d/i,
-    /union\s+select/i,
-    /--\s/,
-    /;\s*(drop|alter|insert|update|delete)/i,
-    /\/\*.*\*\//,
-    /xp_/i,
-    /information_schema/i,
-  ];
-  return patterns.some((p) => p.test(value));
 }

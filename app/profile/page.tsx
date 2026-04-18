@@ -5,6 +5,11 @@ import { useRouter } from "next/navigation";
 import Sidebar from "../../components/Sidebar";
 import { useTheme } from "../../components/ThemeProvider";
 
+// ── Shared patch state key (same key the defense console writes to) ──────────
+// The defense console calls: localStorage.setItem('patched_jwt', '1')
+// This page reads it to show the "fixed" banner and block forge attempts.
+const PATCH_KEY = "patched_jwt";
+
 function signJwt(payload: object, secret: string) {
   const encode = (obj: any) =>
     btoa(JSON.stringify(obj))
@@ -28,7 +33,7 @@ function decodePayload(token: string): any {
   }
 }
 
-type Stage = "idle" | "editing" | "forging" | "success" | "error";
+type Stage = "idle" | "editing" | "forging" | "success" | "error" | "blocked";
 
 export default function ProfilePage() {
   const { isDark } = useTheme();
@@ -42,9 +47,9 @@ export default function ProfilePage() {
   const [stage, setStage] = useState<Stage>("idle");
   const [forgedUser, setForgedUser] = useState<any>(null);
   const [apiError, setApiError] = useState("");
+  const [jwtFixed, setJwtFixed] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Dynamic theme colors
   const theme = {
     bgMain: isDark ? "#000000" : "#F9F8F6",
     textMain: isDark ? "#EDEDED" : "#1A1A1A",
@@ -61,6 +66,16 @@ export default function ProfilePage() {
     forgedBannerText: isDark ? "#FACC15" : "#92710A",
     forgedBannerBorder: isDark ? "#422006" : "#F5D76E",
   };
+
+  // ── Poll localStorage for JWT patch status (set by the defense console)
+  useEffect(() => {
+    function check() {
+      setJwtFixed(localStorage.getItem(PATCH_KEY) === "1");
+    }
+    check();
+    const iv = setInterval(check, 800);
+    return () => clearInterval(iv);
+  }, []);
 
   useEffect(() => {
     const tok = localStorage.getItem("token");
@@ -118,7 +133,68 @@ export default function ProfilePage() {
     }
   };
 
+  // ── Detect if the payload is trying to escalate privileges
+  function isPrivilegeEscalation(payload: any): boolean {
+    const original = decodePayload(token);
+    if (!original) return true;
+    return payload.id !== original.id || payload.role !== original.role;
+  }
+
+  // ── Push a real attack event to localStorage so the defense console picks it up
+  function pushRealAttack(blocked: boolean) {
+    try {
+      const payload = JSON.parse(editedPayload);
+      const entry = {
+        id: Math.random().toString(36).slice(2, 10).toUpperCase(),
+        ts: Date.now(),
+        type: "jwt_forge",
+        severity: "critical",
+        ip: "REAL ATTACKER",
+        port: 443,
+        user: user?.username || "anon",
+        detail: blocked
+          ? `✦ REAL ATTACK — JWT forge BLOCKED: algorithm enforcement rejected modified payload`
+          : `✦ REAL ATTACK — JWT forge SUCCEEDED: payload modified and accepted by server`,
+        endpoint: "/api/user",
+        method: "GET",
+        statusCode: blocked ? 401 : 200,
+        userAgent: navigator.userAgent.slice(0, 60),
+        payload: `forged payload: ${JSON.stringify(payload)}`,
+        country: "LIVE",
+        patched: blocked,
+        blocked: false,
+        detected: false,
+        restored: false,
+      };
+      const existing = JSON.parse(
+        localStorage.getItem("real_attack_log") || "[]",
+      );
+      existing.unshift(entry);
+      localStorage.setItem(
+        "real_attack_log",
+        JSON.stringify(existing.slice(0, 50)),
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
   const forgeAndFetch = async () => {
+    // ── If patch is active, block the exploit before it even hits the server
+    if (jwtFixed) {
+      try {
+        const payload = JSON.parse(editedPayload);
+        if (isPrivilegeEscalation(payload)) {
+          setStage("blocked");
+          pushRealAttack(true);
+          return;
+        }
+      } catch {
+        setParseError("Invalid JSON");
+        return;
+      }
+    }
+
     try {
       setStage("forging");
       const payload = JSON.parse(editedPayload);
@@ -135,6 +211,7 @@ export default function ProfilePage() {
         localStorage.setItem("forgedUser", JSON.stringify(data.user));
         localStorage.setItem("stage", "success");
         localStorage.setItem("forgedToken", forged);
+        pushRealAttack(false);
       } else {
         setApiError(data.message || "Request failed");
         setStage("error");
@@ -193,6 +270,12 @@ export default function ProfilePage() {
       text: isDark ? "#FB7185" : "#BE123C",
       dot: "#FB7185",
       label: "Rejected ✗",
+    },
+    blocked: {
+      bg: isDark ? "#1c1c00" : "#FFFBEB",
+      text: isDark ? "#FBBF24" : "#92400E",
+      dot: "#F59E0B",
+      label: "Blocked ⛔",
     },
   };
 
@@ -313,7 +396,6 @@ export default function ProfilePage() {
             transition: "all .4s",
           }}
         >
-          {/* Card top strip */}
           <div
             style={{
               background: forgedUser
@@ -429,8 +511,6 @@ export default function ProfilePage() {
               </div>
             </div>
           </div>
-
-          {/* Card bottom grid */}
           <div
             style={{
               display: "grid",
@@ -631,43 +711,181 @@ export default function ProfilePage() {
                 JWT Payload Editor
               </span>
             </div>
-
-            {/* Stage pill */}
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                background: isDark
-                  ? "rgba(0,0,0,0.1)"
-                  : "rgba(255,255,255,0.08)",
-                padding: "5px 12px",
-                borderRadius: 20,
-              }}
-            >
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              {/* Stage pill */}
               <div
                 style={{
-                  width: 6,
-                  height: 6,
-                  borderRadius: "50%",
-                  background: stagePill[stage].dot,
-                  flexShrink: 0,
-                }}
-              />
-              <span
-                style={{
-                  fontSize: 11,
-                  fontWeight: 700,
-                  color: isDark ? "rgba(0,0,0,0.6)" : "rgba(255,255,255,0.7)",
-                  letterSpacing: ".04em",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  background: isDark
+                    ? "rgba(0,0,0,0.1)"
+                    : "rgba(255,255,255,0.08)",
+                  padding: "5px 12px",
+                  borderRadius: 20,
                 }}
               >
-                {stagePill[stage].label}
-              </span>
+                <div
+                  style={{
+                    width: 6,
+                    height: 6,
+                    borderRadius: "50%",
+                    background: stagePill[stage].dot,
+                    flexShrink: 0,
+                  }}
+                />
+                <span
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 700,
+                    color: isDark ? "rgba(0,0,0,0.6)" : "rgba(255,255,255,0.7)",
+                    letterSpacing: ".04em",
+                  }}
+                >
+                  {stagePill[stage].label}
+                </span>
+              </div>
             </div>
           </div>
 
           <div style={{ padding: "28px" }}>
+            {/* ── JWT Forgery FIXED banner ── */}
+            {jwtFixed && (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: 12,
+                  background: "#f0fdf4",
+                  border: "1px solid #86efac",
+                  borderRadius: 10,
+                  padding: "14px 16px",
+                  marginBottom: 20,
+                }}
+              >
+                <div
+                  style={{
+                    width: 28,
+                    height: 28,
+                    background: "#16a34a",
+                    borderRadius: "50%",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    flexShrink: 0,
+                    marginTop: 1,
+                  }}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                    <path
+                      d="M20 6L9 17l-5-5"
+                      stroke="white"
+                      strokeWidth="2.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </div>
+                <div>
+                  <div
+                    style={{
+                      fontSize: 13,
+                      fontWeight: 700,
+                      color: "#15803d",
+                      marginBottom: 3,
+                    }}
+                  >
+                    JWT Forgery — Patched
+                  </div>
+                  <div
+                    style={{ fontSize: 12, color: "#166534", lineHeight: 1.5 }}
+                  >
+                    A defender deployed a hotfix. The server now enforces{" "}
+                    <code
+                      style={{
+                        background: "#dcfce7",
+                        padding: "1px 5px",
+                        borderRadius: 3,
+                        fontFamily: "monospace",
+                        fontSize: 11,
+                      }}
+                    >
+                      HS256
+                    </code>{" "}
+                    only and requires a strong secret. Privilege escalation via
+                    forged tokens is blocked.
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* ── Attack BLOCKED banner ── */}
+            {stage === "blocked" && (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: 12,
+                  background: "#fff7ed",
+                  border: "1px solid #fed7aa",
+                  borderRadius: 10,
+                  padding: "14px 16px",
+                  marginBottom: 20,
+                }}
+              >
+                <div
+                  style={{
+                    width: 28,
+                    height: 28,
+                    background: "#ea580c",
+                    borderRadius: "50%",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    flexShrink: 0,
+                    marginTop: 1,
+                  }}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                    <circle
+                      cx="12"
+                      cy="12"
+                      r="10"
+                      stroke="white"
+                      strokeWidth="2"
+                    />
+                    <line
+                      x1="4.93"
+                      y1="4.93"
+                      x2="19.07"
+                      y2="19.07"
+                      stroke="white"
+                      strokeWidth="2"
+                    />
+                  </svg>
+                </div>
+                <div>
+                  <div
+                    style={{
+                      fontSize: 13,
+                      fontWeight: 700,
+                      color: "#c2410c",
+                      marginBottom: 3,
+                    }}
+                  >
+                    Forge Attempt Blocked
+                  </div>
+                  <div
+                    style={{ fontSize: 12, color: "#9a3412", lineHeight: 1.5 }}
+                  >
+                    Privilege escalation payload was intercepted before reaching
+                    the server. The JWT fix enforces algorithm restrictions and
+                    secret strength — this forge is rejected.
+                  </div>
+                </div>
+              </div>
+            )}
+
             <p
               style={{
                 fontSize: 13,
@@ -730,7 +948,6 @@ export default function ProfilePage() {
                   }}
                 />
               </div>
-
               <div>
                 <div
                   style={{
@@ -829,8 +1046,43 @@ export default function ProfilePage() {
               )}
             </div>
 
+            {/* Security status strip */}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                marginTop: 16,
+                padding: "10px 12px",
+                background: jwtFixed ? "#f0fdf4" : isDark ? "#111" : "#fafaf9",
+                border: `1px solid ${jwtFixed ? "#bbf7d0" : isDark ? "#27272A" : "#e8e5df"}`,
+                borderRadius: 8,
+              }}
+            >
+              <div
+                style={{
+                  width: 7,
+                  height: 7,
+                  borderRadius: "50%",
+                  background: jwtFixed ? "#16a34a" : "#d97706",
+                  flexShrink: 0,
+                }}
+              />
+              <span
+                style={{
+                  fontSize: 11,
+                  color: jwtFixed ? "#15803d" : isDark ? "#a16207" : "#92400e",
+                  fontFamily: "monospace",
+                }}
+              >
+                {jwtFixed
+                  ? "JWT Forgery: PATCHED (HS256 enforced, weak secret removed)"
+                  : "JWT Forgery: VULNERABLE (accepts any algorithm, weak fallback secret)"}
+              </span>
+            </div>
+
             {/* Forged token display */}
-            {forgedToken && (
+            {forgedToken && stage !== "blocked" && (
               <div
                 style={{
                   marginTop: 16,
