@@ -3,10 +3,13 @@
 // ' OR '1'='1
 // ' OR 1=1 --
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import Sidebar from "../../components/Sidebar";
 import { useTheme } from "../../components/ThemeProvider";
+
+// ── Shared patch state key (same key the defense console writes to) ──────────
+const PATCH_KEY = "patched_sqli";
 
 export default function SearchPage() {
   const { isDark } = useTheme();
@@ -15,8 +18,119 @@ export default function SearchPage() {
   const [results, setResults] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
+  const [sqliFixed, setSqliFixed] = useState(false);
+  const [attackBlocked, setAttackBlocked] = useState(false);
+  const [lastAttack, setLastAttack] = useState<string | null>(null);
 
-  // Dynamic theme colors matching your global design system
+  // Poll localStorage for patch status (set by the defense console)
+  useEffect(() => {
+    function check() {
+      setSqliFixed(localStorage.getItem(PATCH_KEY) === "1");
+    }
+    check();
+    const iv = setInterval(check, 800);
+    return () => clearInterval(iv);
+  }, []);
+
+  // Detect SQLi patterns (mirrors login page detection)
+  function detectSqliPattern(val: string): boolean {
+    return (
+      /'\s*(or|and)\s*'?\d/i.test(val) ||
+      /--[\s]/.test(val) ||
+      /--$/.test(val.trim()) ||
+      /#/.test(val) ||
+      /union\s+select/i.test(val) ||
+      /;\s*(drop|alter|insert)/i.test(val) ||
+      /'\s*or\s*'1'\s*=\s*'1/i.test(val) ||
+      /'\s*--\s*/.test(val) ||
+      /'\s*or\s+1\s*=\s*1/i.test(val) ||
+      /'\s*or\s+'?1'?\s*=\s*'?1/i.test(val)
+    );
+  }
+
+  // Push a real attack event so the defense console picks it up
+  function pushRealAttack(q: string, succeeded: boolean) {
+    const entry = {
+      id: Math.random().toString(36).slice(2, 10).toUpperCase(),
+      ts: Date.now(),
+      type: "sqli",
+      severity: "critical",
+      ip: "REAL ATTACKER",
+      port: 443,
+      user: "anon",
+      detail: succeeded
+        ? `✦ REAL ATTACK — SQLi SUCCEEDED in search: dumped results via "${q}"`
+        : `✦ REAL ATTACK — SQLi attempt blocked in search form: "${q}"`,
+      endpoint: "/api/search",
+      method: "GET",
+      statusCode: succeeded ? 200 : 403,
+      userAgent: navigator.userAgent.slice(0, 60),
+      payload: `query=${q}`,
+      country: "LIVE",
+      patched: !succeeded,
+      blocked: false,
+      detected: false,
+      restored: false,
+    };
+    try {
+      const existing = JSON.parse(
+        localStorage.getItem("real_attack_log") || "[]",
+      );
+      existing.unshift(entry);
+      localStorage.setItem(
+        "real_attack_log",
+        JSON.stringify(existing.slice(0, 50)),
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const runSearch = async () => {
+    if (!query.trim()) return;
+
+    const isInjection = detectSqliPattern(query);
+
+    // If patch is active, block the exploit before it hits the server
+    if (isInjection && sqliFixed) {
+      setAttackBlocked(true);
+      setLastAttack(query);
+      setSearched(false);
+      setResults([]);
+      pushRealAttack(query, false);
+      return;
+    }
+
+    setAttackBlocked(false);
+    setLastAttack(null);
+
+    if (isInjection) {
+      pushRealAttack(query, false); // will update to success if it works
+    }
+
+    setLoading(true);
+    setSearched(true);
+
+    try {
+      const res = await fetch(`/api/search?query=${encodeURIComponent(query)}`);
+      const data = await res.json();
+
+      if (data.success) {
+        setResults(data.results || []);
+        // If injection succeeded and returned more rows than expected
+        if (isInjection && (data.results?.length ?? 0) > 0) {
+          pushRealAttack(query, true);
+        }
+      } else {
+        setResults([]);
+      }
+    } catch {
+      setResults([]);
+    }
+
+    setLoading(false);
+  };
+
   const theme = {
     bgMain: isDark ? "#000000" : "#F9F8F6",
     textMain: isDark ? "#EDEDED" : "#1A1A1A",
@@ -36,23 +150,7 @@ export default function SearchPage() {
     leakText: isDark ? "#52525B" : "#D1CEC7",
   };
 
-  const runSearch = async () => {
-    if (!query.trim()) return;
-    setLoading(true);
-    setSearched(true);
-
-    try {
-      const res = await fetch(`/api/search?query=${encodeURIComponent(query)}`);
-      const data = await res.json();
-
-      if (data.success) setResults(data.results || []);
-      else setResults([]);
-    } catch {
-      setResults([]);
-    }
-
-    setLoading(false);
-  };
+  const isCurrentlyInjection = detectSqliPattern(query);
 
   return (
     <div
@@ -77,7 +175,7 @@ export default function SearchPage() {
           margin: "0 auto",
         }}
       >
-        {/* Header Section */}
+        {/* Header */}
         <header style={{ marginBottom: 40 }}>
           <h1
             style={{
@@ -94,7 +192,6 @@ export default function SearchPage() {
             Search for other Neobank users to send money instantly.
           </p>
 
-          {/* Debug Hint */}
           <div
             style={{
               marginTop: 12,
@@ -111,23 +208,168 @@ export default function SearchPage() {
           </div>
         </header>
 
+        {/* ── SQL Injection FIXED banner ── */}
+        {sqliFixed && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "flex-start",
+              gap: 12,
+              background: "#f0fdf4",
+              border: "1px solid #86efac",
+              borderRadius: 12,
+              padding: "14px 18px",
+              marginBottom: 24,
+              maxWidth: "700px",
+            }}
+          >
+            <div
+              style={{
+                width: 28,
+                height: 28,
+                background: "#16a34a",
+                borderRadius: "50%",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+                marginTop: 1,
+              }}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                <path
+                  d="M20 6L9 17l-5-5"
+                  stroke="white"
+                  strokeWidth="2.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </div>
+            <div>
+              <div
+                style={{
+                  fontSize: 13,
+                  fontWeight: 700,
+                  color: "#15803d",
+                  marginBottom: 3,
+                }}
+              >
+                SQL Injection — Patched
+              </div>
+              <div style={{ fontSize: 12, color: "#166534", lineHeight: 1.5 }}>
+                A defender deployed a hotfix. Parameterized queries are now
+                active on this endpoint. Payloads like{" "}
+                <code
+                  style={{
+                    background: "#dcfce7",
+                    padding: "1px 5px",
+                    borderRadius: 3,
+                    fontFamily: "monospace",
+                    fontSize: 11,
+                  }}
+                >
+                  ' OR 1=1 --
+                </code>{" "}
+                are blocked.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── Attack BLOCKED banner ── */}
+        {attackBlocked && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "flex-start",
+              gap: 12,
+              background: "#fff7ed",
+              border: "1px solid #fed7aa",
+              borderRadius: 12,
+              padding: "14px 18px",
+              marginBottom: 24,
+              maxWidth: "700px",
+            }}
+          >
+            <div
+              style={{
+                width: 28,
+                height: 28,
+                background: "#ea580c",
+                borderRadius: "50%",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+                marginTop: 1,
+              }}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                <circle cx="12" cy="12" r="10" stroke="white" strokeWidth="2" />
+                <line
+                  x1="4.93"
+                  y1="4.93"
+                  x2="19.07"
+                  y2="19.07"
+                  stroke="white"
+                  strokeWidth="2"
+                />
+              </svg>
+            </div>
+            <div>
+              <div
+                style={{
+                  fontSize: 13,
+                  fontWeight: 700,
+                  color: "#c2410c",
+                  marginBottom: 3,
+                }}
+              >
+                Attack Blocked
+              </div>
+              <div style={{ fontSize: 12, color: "#9a3412", lineHeight: 1.5 }}>
+                Payload{" "}
+                <code
+                  style={{
+                    background: "#ffedd5",
+                    padding: "1px 5px",
+                    borderRadius: 3,
+                    fontFamily: "monospace",
+                    fontSize: 11,
+                  }}
+                >
+                  {lastAttack}
+                </code>{" "}
+                was intercepted. This search is protected by parameterized
+                queries.
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Search Input Card */}
         <section
           style={{
             background: theme.cardBg,
-            border: `1px solid ${theme.borderMain}`,
+            border: `1px solid ${isCurrentlyInjection && !sqliFixed ? "#fca5a5" : theme.borderMain}`,
             borderRadius: 24,
             padding: "32px",
             marginBottom: 32,
             maxWidth: "700px",
             boxShadow: isDark ? "none" : "0 4px 12px rgba(132, 125, 110, 0.04)",
+            transition: "border-color 0.2s",
           }}
         >
           <div style={{ display: "flex", gap: 12 }}>
             <div style={{ flex: 1, position: "relative" }}>
               <input
                 value={query}
-                onChange={(e) => setQuery(e.target.value)}
+                onChange={(e) => {
+                  setQuery(e.target.value);
+                  setAttackBlocked(false);
+                  setLastAttack(null);
+                }}
                 onKeyDown={(e) => e.key === "Enter" && runSearch()}
                 placeholder="Enter username or account ID..."
                 style={{
@@ -138,9 +380,32 @@ export default function SearchPage() {
                   outline: "none",
                   transition: "all 0.2s",
                   boxSizing: "border-box",
+                  background:
+                    isCurrentlyInjection && !sqliFixed
+                      ? isDark
+                        ? "#1a0a0a"
+                        : "#fff5f5"
+                      : undefined,
+                  borderColor:
+                    isCurrentlyInjection && !sqliFixed ? "#fca5a5" : undefined,
                 }}
                 className="search-input"
               />
+              {/* Injection hint for red team */}
+              {isCurrentlyInjection && !sqliFixed && (
+                <div
+                  style={{
+                    position: "absolute",
+                    bottom: -20,
+                    left: 4,
+                    fontSize: 11,
+                    color: "#ef4444",
+                    fontFamily: "monospace",
+                  }}
+                >
+                  ⚠ Injection pattern detected
+                </div>
+              )}
             </div>
             <button
               onClick={runSearch}
@@ -155,15 +420,52 @@ export default function SearchPage() {
                 fontWeight: 700,
                 cursor: loading ? "not-allowed" : "pointer",
                 transition: "transform 0.1s active",
+                opacity: loading ? 0.6 : 1,
               }}
             >
               {loading ? "..." : "Search"}
             </button>
           </div>
+
+          {/* Security status strip */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              marginTop: isCurrentlyInjection && !sqliFixed ? 28 : 16,
+              padding: "8px 12px",
+              background: sqliFixed ? "#f0fdf4" : isDark ? "#111" : "#fafaf9",
+              border: `1px solid ${sqliFixed ? "#bbf7d0" : isDark ? "#27272a" : "#e8e5df"}`,
+              borderRadius: 8,
+              transition: "all 0.3s",
+            }}
+          >
+            <div
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: "50%",
+                background: sqliFixed ? "#16a34a" : "#d97706",
+                flexShrink: 0,
+              }}
+            />
+            <span
+              style={{
+                fontSize: 11,
+                color: sqliFixed ? "#15803d" : isDark ? "#a16207" : "#92400e",
+                fontFamily: "monospace",
+              }}
+            >
+              {sqliFixed
+                ? "SQL Injection: PATCHED (parameterized queries active)"
+                : "SQL Injection: VULNERABLE (raw query interpolation active)"}
+            </span>
+          </div>
         </section>
 
-        {/* Results Section */}
-        {searched && (
+        {/* Results */}
+        {searched && !attackBlocked && (
           <div
             style={{
               background: theme.cardBg,
@@ -204,7 +506,7 @@ export default function SearchPage() {
                   fontSize: 15,
                   color: theme.textSub,
                 }}
-                /* 🔥 Reflected XSS Point */
+                /* 🔥 Reflected XSS Point — intentionally left vulnerable */
                 dangerouslySetInnerHTML={{
                   __html: `No users found matching "<strong>${query}</strong>"`,
                 }}
@@ -229,7 +531,6 @@ export default function SearchPage() {
                   <div
                     style={{ display: "flex", alignItems: "center", gap: 16 }}
                   >
-                    {/* Avatar Circle */}
                     <div
                       style={{
                         width: 44,
@@ -248,7 +549,7 @@ export default function SearchPage() {
                     </div>
 
                     <div>
-                      {/* 🔥 Stored XSS Point */}
+                      {/* 🔥 Stored XSS Point — intentionally left vulnerable */}
                       <div
                         style={{
                           fontWeight: 700,
@@ -256,17 +557,14 @@ export default function SearchPage() {
                           marginBottom: 2,
                           color: theme.textMain,
                         }}
-                        dangerouslySetInnerHTML={{
-                          __html: u.username || u[1],
-                        }}
+                        dangerouslySetInnerHTML={{ __html: u.username || u[1] }}
                       />
 
-                      {/* Data leakage Point */}
                       <div style={{ fontSize: 13, color: theme.textSub }}>
                         {u.email || u[2]}
                       </div>
 
-                      {/* Hidden Debug Leak */}
+                      {/* Debug Leak */}
                       <div
                         style={{
                           marginTop: 4,
@@ -283,7 +581,6 @@ export default function SearchPage() {
                     </div>
                   </div>
 
-                  {/* IDOR helper link */}
                   <a
                     href={`/transfer?to=${u.account_number || ""}`}
                     style={{
@@ -309,7 +606,6 @@ export default function SearchPage() {
       </main>
 
       <style jsx>{`
-        /* Dynamic Input Styles */
         [data-theme="light"] .search-input {
           background: #f9f8f6;
           border: 1px solid #edeae4;
@@ -336,7 +632,6 @@ export default function SearchPage() {
           color: #8a7f6e;
         }
 
-        /* Hover States */
         [data-theme="light"] .result-row:hover {
           background-color: #fafaf9;
         }

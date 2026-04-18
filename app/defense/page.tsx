@@ -602,22 +602,59 @@ export default function DefensePage() {
     }
   }
 
+  // ── Drop this into your DefensePage's submitChallenge() function ──────────
+  // Replace the existing submitChallenge() with this version.
+  // The only addition is the fetch() call to /api/patch after a pass,
+  // which writes a server-side flag file so the API routes also switch
+  // to parameterized queries.
+
+  const PATCH_TARGET_MAP: Partial<Record<AttackType, string>> = {
+    sqli: "sqli",
+    jwt_forge: "jwt",
+    xss: "xss",
+    idor: "idor",
+  };
+
   function submitChallenge() {
     if (!challengeType || !challenge) return;
     setChallengeResult("running");
+
     setTimeout(() => {
       const result = challenge.validate(challengeCode);
       setChallengeResult(result.pass ? "pass" : "fail");
       setChallengeFeedback(result.feedback);
+
       if (result.pass) {
+        // 1. Mark all logs of this type as patched in UI
         setLogs((prev) =>
           prev.map((l) =>
             l.type === challengeType ? { ...l, patched: true } : l,
           ),
         );
+
+        // 2. Add to patched set so new attacks stop spawning
         setPatchedTypes((prev) => new Set([...prev, challengeType]));
-        const key = PATCH_KEYS[challengeType];
-        if (key) localStorage.setItem(key, "1");
+
+        // 3. Write localStorage key so other pages (login, search, profile) show banners
+        const lsKey = PATCH_KEYS[challengeType];
+        if (lsKey) localStorage.setItem(lsKey, "1");
+
+        // 4. ── NEW: Write server-side flag so API routes switch to safe queries ──
+        const apiTarget = PATCH_TARGET_MAP[challengeType];
+        if (apiTarget) {
+          fetch("/api/patch", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ target: apiTarget, action: "apply" }),
+          }).catch(() => {
+            // Non-critical — client-side patch still works even if this fails
+            console.warn(
+              "[patch] Server-side flag write failed — client-side patch still active",
+            );
+          });
+        }
+
+        // 5. Award points and update ledger
         const pts = challenge.points;
         setScore((s) => s + pts);
         setScoreHistory((h) =>
