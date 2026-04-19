@@ -5,7 +5,6 @@ import { useRouter } from "next/navigation";
 import Sidebar from "../../components/Sidebar";
 import { useTheme } from "../../components/ThemeProvider";
 
-// Reusable components for cleaner code
 const Badge = ({
   type,
   isDark,
@@ -49,8 +48,12 @@ export default function TransactionsPage() {
   const [txns, setTxns] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<"all" | "credit" | "debit">("all");
+  const [manualUserId, setManualUserId] = useState("");
+  const [lookupResult, setLookupResult] = useState<any[] | null>(null);
+  const [lookupError, setLookupError] = useState<string | null>(null);
+  const [lookupLoading, setLookupLoading] = useState(false);
+  const [rawQuery, setRawQuery] = useState<string | null>(null);
 
-  // Dynamic theme colors matching the dashboard
   const theme = {
     bgMain: isDark ? "#000000" : "#F9F8F6",
     textMain: isDark ? "#EDEDED" : "#1A1A1A",
@@ -64,6 +67,8 @@ export default function TransactionsPage() {
     creditText: isDark ? "#4ADE80" : "#166534",
     debitBg: isDark ? "rgba(239, 68, 68, 0.1)" : "#FFF1F2",
     debitText: isDark ? "#F87171" : "#991B1B",
+    debugBg: isDark ? "#111111" : "#F1EFE9",
+    debugText: isDark ? "#52525B" : "#B8B2A7",
   };
 
   const fetchTransactions = async () => {
@@ -110,10 +115,48 @@ export default function TransactionsPage() {
     return () => clearInterval(interval);
   }, [router]);
 
+  // ── Manual userId lookup — the IDOR/SQLi entry point ──────────────────
+  const runLookup = async () => {
+    if (!manualUserId.trim()) return;
+    setLookupLoading(true);
+    setLookupResult(null);
+    setLookupError(null);
+    setRawQuery(null);
+
+    const token =
+      localStorage.getItem("forgedToken") || localStorage.getItem("token");
+
+    try {
+      const res = await fetch(
+        `/api/transactions?userId=${encodeURIComponent(manualUserId)}`,
+        { headers: { Authorization: `Bearer ${token || ""}` } },
+      );
+      const data = await res.json();
+
+      if (data.success) {
+        setLookupResult(data.transactions || []);
+        // Server echoes back the raw query on success — grab it
+        if (data.query) setRawQuery(data.query);
+      } else {
+        // Server leaks query + stack on error
+        setLookupError(data.message || "Unknown error");
+        if (data.query) setRawQuery(data.query);
+        if (data.stack) console.error("[SERVER STACK]", data.stack);
+      }
+    } catch {
+      setLookupError("Request failed");
+    } finally {
+      setLookupLoading(false);
+    }
+  };
+
   const filteredTxns = useMemo(
     () => (filter === "all" ? txns : txns.filter((t) => t.type === filter)),
     [filter, txns],
   );
+
+  const displayTxns = lookupResult !== null ? lookupResult : filteredTxns;
+  const isLookupMode = lookupResult !== null;
 
   return (
     <div
@@ -137,7 +180,7 @@ export default function TransactionsPage() {
           margin: "0 auto",
         }}
       >
-        {/* Header Section */}
+        {/* Header */}
         <header
           style={{
             marginBottom: 40,
@@ -161,6 +204,22 @@ export default function TransactionsPage() {
             <p style={{ fontSize: 16, color: theme.textSub }}>
               View and manage your recent activity.
             </p>
+
+            {/* Debug hint — visible bait for red teamers */}
+            <div
+              style={{
+                marginTop: 10,
+                fontSize: 11,
+                color: theme.debugText,
+                fontFamily: "monospace",
+                background: theme.debugBg,
+                padding: "4px 10px",
+                borderRadius: 6,
+                display: "inline-block",
+              }}
+            >
+              // DEBUG: userId param passed directly to query — no sanitization
+            </div>
           </div>
 
           <div
@@ -175,7 +234,12 @@ export default function TransactionsPage() {
             {(["all", "credit", "debit"] as const).map((f) => (
               <button
                 key={f}
-                onClick={() => setFilter(f)}
+                onClick={() => {
+                  setFilter(f);
+                  setLookupResult(null);
+                  setLookupError(null);
+                  setRawQuery(null);
+                }}
                 style={{
                   padding: "8px 16px",
                   borderRadius: 8,
@@ -185,10 +249,15 @@ export default function TransactionsPage() {
                   cursor: "pointer",
                   transition: "all 0.2s ease",
                   background:
-                    filter === f ? theme.filterActiveBg : "transparent",
-                  color: filter === f ? theme.textMain : theme.textSub,
+                    filter === f && !isLookupMode
+                      ? theme.filterActiveBg
+                      : "transparent",
+                  color:
+                    filter === f && !isLookupMode
+                      ? theme.textMain
+                      : theme.textSub,
                   boxShadow:
-                    filter === f && !isDark
+                    filter === f && !isLookupMode && !isDark
                       ? "0 2px 4px rgba(0,0,0,0.05)"
                       : "none",
                 }}
@@ -199,19 +268,190 @@ export default function TransactionsPage() {
           </div>
         </header>
 
-        {/* Content Card */}
+        {/* ── userId lookup panel ───────────────────────────────────────────
+             This is the IDOR + SQLi attack surface.
+             No auth check, no sanitization — userId goes straight into the query.
+             Try:  2          → another user's transactions (IDOR)
+             Try:  1 OR 1=1  → all transactions (SQLi boolean)
+             Try:  1 UNION SELECT id,username,email,password_hash,role,balance,account_number,created_at FROM users--
+                              → dump users table
+        ─────────────────────────────────────────────────────────────────── */}
+        <div
+          style={{
+            background: theme.cardBg,
+            border: `1px solid ${lookupError ? "#fca5a5" : isLookupMode ? "#fdba74" : theme.borderMain}`,
+            borderRadius: 16,
+            padding: "20px 24px",
+            marginBottom: 24,
+            transition: "border-color 0.2s",
+          }}
+        >
+          <div
+            style={{
+              fontSize: 11,
+              fontWeight: 700,
+              color: theme.textSub,
+              letterSpacing: "0.08em",
+              textTransform: "uppercase",
+              marginBottom: 10,
+            }}
+          >
+            Account Transaction Lookup
+          </div>
+
+          <div style={{ display: "flex", gap: 10 }}>
+            <input
+              value={manualUserId}
+              onChange={(e) => setManualUserId(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && runLookup()}
+              placeholder="Enter user ID (e.g. 1, 2, 3…)"
+              style={{
+                flex: 1,
+                padding: "10px 14px",
+                borderRadius: 10,
+                fontSize: 13,
+                fontFamily: "monospace",
+                background: isDark ? "#111111" : "#f9f8f6",
+                border: `1px solid ${theme.borderMain}`,
+                color: theme.textMain,
+                outline: "none",
+              }}
+            />
+            <button
+              onClick={runLookup}
+              disabled={lookupLoading}
+              style={{
+                padding: "10px 20px",
+                borderRadius: 10,
+                fontSize: 13,
+                fontWeight: 700,
+                background: isDark ? "#EDEDED" : "#1A1A1A",
+                color: isDark ? "#000" : "#fff",
+                border: "none",
+                cursor: lookupLoading ? "not-allowed" : "pointer",
+                opacity: lookupLoading ? 0.6 : 1,
+              }}
+            >
+              {lookupLoading ? "..." : "Fetch"}
+            </button>
+            {isLookupMode && (
+              <button
+                onClick={() => {
+                  setLookupResult(null);
+                  setLookupError(null);
+                  setRawQuery(null);
+                  setManualUserId("");
+                }}
+                style={{
+                  padding: "10px 16px",
+                  borderRadius: 10,
+                  fontSize: 13,
+                  fontWeight: 600,
+                  background: "transparent",
+                  border: `1px solid ${theme.borderMain}`,
+                  color: theme.textSub,
+                  cursor: "pointer",
+                }}
+              >
+                ✕ Clear
+              </button>
+            )}
+          </div>
+
+          {/* Raw query leak — server echoes it back on both success and error */}
+          {rawQuery && (
+            <div
+              style={{
+                marginTop: 12,
+                padding: "10px 14px",
+                background: isDark ? "#0a0a0a" : "#fef2f2",
+                border: "1px solid #fca5a5",
+                borderRadius: 8,
+                fontFamily: "monospace",
+                fontSize: 11,
+                color: "#dc2626",
+                wordBreak: "break-all",
+                lineHeight: 1.6,
+              }}
+            >
+              <span style={{ fontWeight: 700, letterSpacing: "0.06em" }}>
+                RAW QUERY:{" "}
+              </span>
+              {rawQuery}
+            </div>
+          )}
+
+          {/* Error message leak */}
+          {lookupError && (
+            <div
+              style={{
+                marginTop: 10,
+                padding: "8px 12px",
+                background: isDark ? "#0a0a0a" : "#fef2f2",
+                border: "1px solid #fca5a5",
+                borderRadius: 8,
+                fontFamily: "monospace",
+                fontSize: 11,
+                color: "#dc2626",
+              }}
+            >
+              <span style={{ fontWeight: 700 }}>ERROR: </span>
+              {lookupError}
+            </div>
+          )}
+
+          {/* IDOR success indicator */}
+          {isLookupMode && !lookupError && (
+            <div
+              style={{
+                marginTop: 10,
+                fontSize: 11,
+                color: "#d97706",
+                fontFamily: "monospace",
+              }}
+            >
+              ⚠ Showing {lookupResult!.length} transaction(s) for userId=
+              <strong>{manualUserId}</strong> — no ownership check performed
+            </div>
+          )}
+        </div>
+
+        {/* Transaction list card */}
         <div
           style={{
             background: theme.cardBg,
             borderRadius: 20,
             boxShadow: isDark
               ? "none"
-              : "0 1px 3px rgba(0,0,0,0.02), 0 8px 24px rgba(132, 125, 110, 0.08)",
-            border: `1px solid ${theme.borderMain}`,
+              : "0 1px 3px rgba(0,0,0,0.02), 0 8px 24px rgba(132,125,110,0.08)",
+            border: `1px solid ${isLookupMode ? "#fdba74" : theme.borderMain}`,
             overflow: "hidden",
+            transition: "border-color 0.2s",
           }}
         >
-          {loading ? (
+          {/* Lookup mode header */}
+          {isLookupMode && (
+            <div
+              style={{
+                padding: "12px 24px",
+                background: isDark ? "rgba(217,119,6,0.08)" : "#fffbeb",
+                borderBottom: `1px solid #fde68a`,
+                fontSize: 12,
+                fontWeight: 600,
+                color: "#92400e",
+                fontFamily: "monospace",
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+              }}
+            >
+              <span style={{ fontSize: 14 }}>⚠</span>
+              IDOR — Viewing transactions for userId={manualUserId} (not your
+              account)
+            </div>
+          )}
+
+          {loading && !isLookupMode ? (
             <div style={{ padding: "60px", textAlign: "center" }}>
               <div
                 className="spinner"
@@ -229,25 +469,27 @@ export default function TransactionsPage() {
                 Updating ledger...
               </p>
             </div>
-          ) : filteredTxns.length === 0 ? (
+          ) : displayTxns.length === 0 ? (
             <div style={{ padding: "80px 40px", textAlign: "center" }}>
               <div style={{ fontSize: 40, marginBottom: 16 }}>🍃</div>
               <p
                 style={{ color: theme.textSub, fontSize: 15, fontWeight: 500 }}
               >
-                No transactions found for this period.
+                {isLookupMode
+                  ? `No transactions found for userId=${manualUserId}`
+                  : "No transactions found for this period."}
               </p>
             </div>
           ) : (
             <div>
-              {filteredTxns.map((t, i) => (
+              {displayTxns.map((t, i) => (
                 <div
                   key={t.id || i}
                   className="txn-row"
                   style={{
                     padding: "20px 32px",
                     borderBottom:
-                      i < filteredTxns.length - 1
+                      i < displayTxns.length - 1
                         ? `1px solid ${theme.borderSub}`
                         : "none",
                     display: "flex",
@@ -296,6 +538,23 @@ export default function TransactionsPage() {
                           year: "numeric",
                         })}
                       </div>
+                      {/* Show raw row dump when IDOR returns unexpected columns (SQLi dump) */}
+                      {t.password_hash ||
+                      t.role ||
+                      (!t.type && !t.description) ? (
+                        <div
+                          style={{
+                            marginTop: 4,
+                            fontSize: 10,
+                            color: "#dc2626",
+                            fontFamily: "monospace",
+                            maxWidth: 400,
+                            wordBreak: "break-all",
+                          }}
+                        >
+                          RAW: {JSON.stringify(t)}
+                        </div>
+                      ) : null}
                     </div>
                   </div>
 
@@ -319,13 +578,22 @@ export default function TransactionsPage() {
                             : theme.textMain,
                       }}
                     >
-                      {t.type === "credit" ? "+" : "-"}$
-                      {Math.abs(parseFloat(t.amount)).toLocaleString(
-                        undefined,
-                        { minimumFractionDigits: 2 },
-                      )}
+                      {t.type === "credit"
+                        ? "+"
+                        : t.type === "debit"
+                          ? "-"
+                          : ""}
+                      $
+                      {isNaN(parseFloat(t.amount))
+                        ? t.amount
+                        : Math.abs(parseFloat(t.amount)).toLocaleString(
+                            undefined,
+                            {
+                              minimumFractionDigits: 2,
+                            },
+                          )}
                     </div>
-                    <Badge type={t.type} isDark={isDark} />
+                    {t.type && <Badge type={t.type} isDark={isDark} />}
                   </div>
                 </div>
               ))}
@@ -343,7 +611,6 @@ export default function TransactionsPage() {
             transform: rotate(360deg);
           }
         }
-        /* Hover effects respecting the theme */
         [data-theme="light"] .txn-row:hover {
           background-color: #fafafa;
         }
