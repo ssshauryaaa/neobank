@@ -3,9 +3,6 @@ import { useState, useEffect } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
-// ── Shared patch state key (same key the defense console writes to) ──────────
-// The defense console calls: localStorage.setItem('patched_sqli', '1')
-// This page reads it to show the "fixed" banner and block the exploit.
 const PATCH_KEY = "patched_sqli";
 
 export default function LoginPage() {
@@ -19,34 +16,31 @@ export default function LoginPage() {
   const [attackBlocked, setAttackBlocked] = useState(false);
   const [lastAttack, setLastAttack] = useState<string | null>(null);
 
-  // Poll localStorage for patch status (set by the defense console)
   useEffect(() => {
-    function check() {
-      setSqliFixed(localStorage.getItem(PATCH_KEY) === "1");
-    }
+    const check = () => setSqliFixed(localStorage.getItem(PATCH_KEY) === "1");
     check();
+    window.addEventListener("storage", check);
     const iv = setInterval(check, 800);
-    return () => clearInterval(iv);
+    return () => {
+      clearInterval(iv);
+      window.removeEventListener("storage", check);
+    };
   }, []);
 
-  // Detect SQLi patterns client-side (mirrors what the server detects)
-  // MySQL requires "-- " (dash dash space) or "#" as a line comment.
-  // So "admin'-- " works but "admin'--" (no trailing space) does not.
-  // We match "--" followed by a space, end-of-string, or any whitespace.
   function detectSqliPattern(val: string): boolean {
     return (
-      /'\s*(or|and)\s*'?\d/i.test(val) ||
-      /--[\s]/.test(val) || // MySQL: -- requires trailing space
-      /--$/.test(val.trim()) || // also catch -- at end after trim
-      /#/.test(val) || // MySQL alternate comment char
-      /union\s+select/i.test(val) ||
-      /;\s*(drop|alter|insert)/i.test(val) ||
-      /'\s*or\s*'1'\s*=\s*'1/i.test(val) ||
-      /'\s*--\s*/.test(val)
-    ); // any quote followed by -- and optional space
+      /'\s*(or|and)\s*'?\d/i.test(val) || // ' OR '1 / ' OR 1
+      /'\s*or\s+1\s*=\s*1/i.test(val) || // ' OR 1=1
+      /'\s*or\s*'1'\s*=\s*'1/i.test(val) || // ' OR '1'='1
+      /--[\s]/.test(val) || // -- (with space)
+      /--$/.test(val.trim()) || // -- at end
+      /'\s*--/.test(val) || // '-- anywhere
+      /#/.test(val) || // MySQL # comment
+      /union\s+select/i.test(val) || // UNION SELECT
+      /;\s*(drop|alter|insert|select)/i.test(val) // stacked queries
+    );
   }
 
-  // ── Write a real attack event to localStorage so the defense console picks it up ──
   function pushRealAttack(
     username: string,
     payload: string,
@@ -98,17 +92,14 @@ export default function LoginPage() {
     const isInjection =
       detectSqliPattern(username) || detectSqliPattern(password);
 
-    // If patch is active, block the exploit before it even hits the server
     if (isInjection && sqliFixed) {
       setLoading(false);
       setAttackBlocked(true);
       setLastAttack(username || password);
-      setError("");
       pushRealAttack(username, username, false);
       return;
     }
 
-    // Log the attempt immediately before the server call
     if (isInjection) {
       pushRealAttack(username, username, false);
     }
@@ -123,21 +114,17 @@ export default function LoginPage() {
       setLoading(false);
 
       if (data.success) {
-        // If they got in via SQLi, update the log entry to show success
         if (isInjection) pushRealAttack(username, username, true);
         localStorage.setItem("token", data.token);
         localStorage.setItem("user", JSON.stringify(data.user));
         document.cookie = `session=${data.user.id}; path=/`;
         router.push("/dashboard");
       } else {
-        // Show a subtle hint if it looks like a SQLi attempt that didn't work
-        if (isInjection) {
-          setError(
-            "Invalid credentials. (Injection attempt logged to defense console.)",
-          );
-        } else {
-          setError(data.message || "Invalid username or password.");
-        }
+        setError(
+          isInjection
+            ? "Invalid credentials. (Injection attempt logged to defense console.)"
+            : data.message || "Invalid username or password.",
+        );
       }
     } catch {
       setLoading(false);
@@ -145,170 +132,147 @@ export default function LoginPage() {
     }
   };
 
-  const s = {
-    page: {
-      minHeight: "100vh",
-      background: "#f8f7f4",
-      display: "flex",
-      fontFamily: "Inter, sans-serif",
-    } as any,
-    left: {
-      flex: 1,
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      padding: "48px 24px",
-    } as any,
-    right: {
-      width: 480,
-      background: "#1a1a1a",
-      display: "flex",
-      flexDirection: "column",
-      justifyContent: "center",
-      padding: "64px 56px",
-    } as any,
-    form: { width: "100%", maxWidth: 400 } as any,
-    label: {
-      display: "block",
-      fontSize: 13,
-      fontWeight: 500,
-      color: "#6b6355",
-      marginBottom: 6,
-    } as any,
-    input: {
-      width: "100%",
-      padding: "12px 14px",
-      border: "1px solid #d4d0c8",
-      borderRadius: 8,
-      fontSize: 14,
-      background: "white",
-      outline: "none",
-      fontFamily: "Inter, sans-serif",
-      boxSizing: "border-box",
-    } as any,
-    btn: {
-      width: "100%",
-      padding: "13px",
-      borderRadius: 8,
-      background: "#1a1a1a",
-      color: "white",
-      fontSize: 14,
-      fontWeight: 600,
-      border: "none",
-      cursor: "pointer",
-      letterSpacing: "-0.2px",
-    } as any,
-    inputWrapper: { position: "relative", width: "100%" } as any,
-    toggleBtn: {
-      position: "absolute",
-      right: 12,
-      top: "50%",
-      transform: "translateY(-50%)",
-      background: "none",
-      border: "none",
-      color: "#8a7f6e",
-      fontSize: 12,
-      fontWeight: 600,
-      cursor: "pointer",
-      outline: "none",
-    } as any,
-  };
+  const usernameInjection = detectSqliPattern(username);
+  const passwordInjection = detectSqliPattern(password);
 
   return (
-    <div style={s.page}>
-      <div style={s.left}>
-        <div style={s.form}>
-          {/* Logo */}
-          <Link
-            href="/"
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              marginBottom: 48,
-              textDecoration: "none",
-              color: "#1a1a1a",
-            }}
-          >
-            <div
+    <>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: #fff; }
+
+        .fade-in { animation: fadeIn 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+
+        .login-input {
+          width: 100%;
+          padding: 12px 16px;
+          border-radius: 10px;
+          font-size: 15px;
+          color: #111827;
+          outline: none;
+          font-family: inherit;
+          transition: all 0.2s ease;
+        }
+        .login-input.normal {
+          border: 1px solid #e5e7eb;
+          background: #f9fafb;
+        }
+        .login-input.normal:focus {
+          background: #ffffff;
+          border-color: #111827;
+          box-shadow: 0 0 0 4px rgba(17,24,39,0.08);
+        }
+        .login-input.danger {
+          border: 1px solid #fca5a5;
+          background: #fff5f5;
+        }
+        .login-input.danger:focus {
+          background: #fff5f5;
+          border-color: #ef4444;
+          box-shadow: 0 0 0 4px rgba(239,68,68,0.1);
+        }
+        .login-input::placeholder { color: #9ca3af; }
+
+        .login-btn {
+          width: 100%;
+          padding: 14px;
+          border-radius: 10px;
+          background: #111827;
+          color: #fff;
+          font-size: 15px;
+          font-weight: 600;
+          border: none;
+          cursor: pointer;
+          transition: all 0.2s ease;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+          gap: 8px;
+          font-family: inherit;
+        }
+        .login-btn:hover:not(:disabled) {
+          background: #1f2937;
+          transform: translateY(-1px);
+          box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        .login-btn:active:not(:disabled) { transform: translateY(0); }
+        .login-btn:disabled { opacity: 0.7; cursor: not-allowed; }
+
+        .stat-row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 20px 0;
+          border-top: 1px solid rgba(255,255,255,0.1);
+          transition: transform 0.3s ease, border-color 0.3s ease;
+        }
+        .stat-row:hover {
+          border-top-color: rgba(255,255,255,0.25);
+          transform: translateX(4px);
+        }
+
+        @media (max-width: 900px) {
+          .right-panel { display: none !important; }
+          .left-panel  { padding: 32px !important; }
+        }
+      `}</style>
+
+      <div
+        style={{
+          display: "flex",
+          minHeight: "100vh",
+          backgroundColor: "#ffffff",
+        }}
+      >
+        {/* ── Left panel ── */}
+        <div
+          className="left-panel"
+          style={{
+            flex: "1 1 50%",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "48px",
+          }}
+        >
+          <div className="fade-in" style={{ width: "100%", maxWidth: "420px" }}>
+            {/* Logo */}
+            <Link
+              href="/"
               style={{
-                width: 28,
-                height: 28,
-                background: "#1a1a1a",
-                borderRadius: 6,
                 display: "flex",
                 alignItems: "center",
-                justifyContent: "center",
-              }}
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                <path
-                  d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"
-                  stroke="white"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-                <polyline
-                  points="9,22 9,12 15,12 15,22"
-                  stroke="white"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
-            </div>
-            <span
-              style={{ fontWeight: 700, fontSize: 16, letterSpacing: "-0.4px" }}
-            >
-              neobank
-            </span>
-          </Link>
-
-          <h1
-            style={{
-              fontSize: 26,
-              fontWeight: 700,
-              letterSpacing: "-0.8px",
-              marginBottom: 6,
-            }}
-          >
-            Welcome back
-          </h1>
-          <p style={{ fontSize: 14, color: "#8a7f6e", marginBottom: 24 }}>
-            Sign in to your account to continue.
-          </p>
-
-          {/* ── SQL Injection FIXED banner ── */}
-          {sqliFixed && (
-            <div
-              style={{
-                display: "flex",
-                alignItems: "flex-start",
-                gap: 12,
-                background: "#f0fdf4",
-                border: "1px solid #86efac",
-                borderRadius: 10,
-                padding: "14px 16px",
-                marginBottom: 20,
+                gap: "10px",
+                marginBottom: "56px",
+                textDecoration: "none",
+                color: "#111827",
               }}
             >
               <div
                 style={{
-                  width: 28,
-                  height: 28,
-                  background: "#16a34a",
-                  borderRadius: "50%",
+                  width: 32,
+                  height: 32,
+                  background: "#111827",
+                  borderRadius: 8,
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
-                  flexShrink: 0,
-                  marginTop: 1,
+                  boxShadow: "0 4px 12px rgba(0,0,0,0.1)",
                 }}
               >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
                   <path
-                    d="M20 6L9 17l-5-5"
+                    d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"
+                    stroke="white"
+                    strokeWidth="2.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                  <polyline
+                    points="9,22 9,12 15,12 15,22"
                     stroke="white"
                     strokeWidth="2.5"
                     strokeLinecap="round"
@@ -316,345 +280,511 @@ export default function LoginPage() {
                   />
                 </svg>
               </div>
-              <div>
-                <div
-                  style={{
-                    fontSize: 13,
-                    fontWeight: 700,
-                    color: "#15803d",
-                    marginBottom: 3,
-                  }}
-                >
-                  SQL Injection — Patched
-                </div>
-                <div
-                  style={{ fontSize: 12, color: "#166534", lineHeight: 1.5 }}
-                >
-                  A defender deployed a hotfix. Parameterized queries are now
-                  active. Injection payloads like{" "}
-                  <code
-                    style={{
-                      background: "#dcfce7",
-                      padding: "1px 5px",
-                      borderRadius: 3,
-                      fontFamily: "monospace",
-                      fontSize: 11,
-                    }}
-                  >
-                    admin'--{" "}
-                  </code>{" "}
-                  (MySQL comment syntax) are blocked.
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* ── Attack BLOCKED banner (shown when patched + injection attempted) ── */}
-          {attackBlocked && (
-            <div
-              style={{
-                display: "flex",
-                alignItems: "flex-start",
-                gap: 12,
-                background: "#fff7ed",
-                border: "1px solid #fed7aa",
-                borderRadius: 10,
-                padding: "14px 16px",
-                marginBottom: 20,
-              }}
-            >
-              <div
+              <span
                 style={{
-                  width: 28,
-                  height: 28,
-                  background: "#ea580c",
-                  borderRadius: "50%",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  flexShrink: 0,
-                  marginTop: 1,
+                  fontWeight: 700,
+                  fontSize: 18,
+                  letterSpacing: "-0.03em",
                 }}
               >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                  <circle
-                    cx="12"
-                    cy="12"
-                    r="10"
-                    stroke="white"
-                    strokeWidth="2"
-                  />
-                  <line
-                    x1="4.93"
-                    y1="4.93"
-                    x2="19.07"
-                    y2="19.07"
-                    stroke="white"
-                    strokeWidth="2"
-                  />
+                neobank.
+              </span>
+            </Link>
+
+            <h1
+              style={{
+                fontSize: 30,
+                fontWeight: 700,
+                letterSpacing: "-0.03em",
+                color: "#111827",
+                marginBottom: 8,
+              }}
+            >
+              Welcome back
+            </h1>
+            <p style={{ fontSize: 15, color: "#6b7280", marginBottom: 32 }}>
+              Sign in to your account to continue securely.
+            </p>
+
+            {/* ── Patched banner ── */}
+            {sqliFixed && (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: 14,
+                  background: "#f0fdf4",
+                  border: "1px solid #bbf7d0",
+                  borderRadius: 12,
+                  padding: 16,
+                  marginBottom: 24,
+                }}
+              >
+                <div
+                  style={{
+                    width: 24,
+                    height: 24,
+                    background: "#22c55e",
+                    borderRadius: "50%",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    flexShrink: 0,
+                  }}
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+                    <path
+                      d="M20 6L9 17l-5-5"
+                      stroke="white"
+                      strokeWidth="3"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </div>
+                <div>
+                  <div
+                    style={{
+                      fontSize: 14,
+                      fontWeight: 600,
+                      color: "#166534",
+                      marginBottom: 4,
+                    }}
+                  >
+                    Protection Active
+                  </div>
+                  <div
+                    style={{ fontSize: 13, color: "#15803d", lineHeight: 1.5 }}
+                  >
+                    Hotfix deployed. Parameterized queries are enforcing
+                    security. Payloads like{" "}
+                    <code
+                      style={{
+                        background: "rgba(34,197,94,0.15)",
+                        padding: "2px 6px",
+                        borderRadius: 4,
+                        fontFamily: "monospace",
+                        fontSize: 12,
+                      }}
+                    >
+                      admin'--
+                    </code>{" "}
+                    are safely neutralized.
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* ── Blocked banner ── */}
+            {attackBlocked && (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: 14,
+                  background: "#fef2f2",
+                  border: "1px solid #fecaca",
+                  borderRadius: 12,
+                  padding: 16,
+                  marginBottom: 24,
+                  animation: "fadeIn 0.3s ease",
+                }}
+              >
+                <div
+                  style={{
+                    width: 24,
+                    height: 24,
+                    background: "#ef4444",
+                    borderRadius: "50%",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    flexShrink: 0,
+                  }}
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+                    <path
+                      d="M18 6L6 18M6 6l12 12"
+                      stroke="white"
+                      strokeWidth="3"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </div>
+                <div>
+                  <div
+                    style={{
+                      fontSize: 14,
+                      fontWeight: 600,
+                      color: "#991b1b",
+                      marginBottom: 4,
+                    }}
+                  >
+                    Threat Intercepted
+                  </div>
+                  <div
+                    style={{ fontSize: 13, color: "#b91c1c", lineHeight: 1.5 }}
+                  >
+                    Malicious payload{" "}
+                    <code
+                      style={{
+                        background: "rgba(239,68,68,0.15)",
+                        padding: "2px 6px",
+                        borderRadius: 4,
+                        fontFamily: "monospace",
+                        fontSize: 12,
+                      }}
+                    >
+                      {lastAttack}
+                    </code>{" "}
+                    was blocked by parameterized queries.
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* ── Generic error ── */}
+            {error && !attackBlocked && (
+              <div
+                style={{
+                  background: "#fef2f2",
+                  border: "1px solid #fecaca",
+                  borderRadius: 12,
+                  padding: "14px 16px",
+                  fontSize: 14,
+                  color: "#b91c1c",
+                  marginBottom: 24,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                }}
+              >
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                >
+                  <circle cx="12" cy="12" r="10" />
+                  <line x1="12" y1="8" x2="12" y2="12" />
+                  <line x1="12" y1="16" x2="12.01" y2="16" />
                 </svg>
+                {error}
               </div>
-              <div>
-                <div
+            )}
+
+            <form onSubmit={handleLogin}>
+              {/* Username */}
+              <div style={{ marginBottom: 20 }}>
+                <label
                   style={{
+                    display: "block",
                     fontSize: 13,
-                    fontWeight: 700,
-                    color: "#c2410c",
-                    marginBottom: 3,
+                    fontWeight: 500,
+                    color: "#374151",
+                    marginBottom: 8,
                   }}
                 >
-                  Attack Blocked
-                </div>
-                <div
-                  style={{ fontSize: 12, color: "#9a3412", lineHeight: 1.5 }}
-                >
-                  Payload{" "}
-                  <code
-                    style={{
-                      background: "#ffedd5",
-                      padding: "1px 5px",
-                      borderRadius: 3,
-                      fontFamily: "monospace",
-                      fontSize: 11,
-                    }}
-                  >
-                    {lastAttack}
-                  </code>{" "}
-                  was intercepted. This login is protected by parameterized
-                  queries.
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* ── Generic error ── */}
-          {error && !attackBlocked && (
-            <div
-              style={{
-                background: "#fef2f2",
-                border: "1px solid #fecaca",
-                borderRadius: 8,
-                padding: "12px 14px",
-                fontSize: 13,
-                color: "#dc2626",
-                marginBottom: 20,
-              }}
-            >
-              {error}
-            </div>
-          )}
-
-          <form onSubmit={handleLogin}>
-            <div style={{ marginBottom: 18 }}>
-              <label style={s.label}>Username</label>
-              <input
-                style={{
-                  ...s.input,
-                  borderColor:
-                    detectSqliPattern(username) && !sqliFixed
-                      ? "#fca5a5"
-                      : "#d4d0c8",
-                  background:
-                    detectSqliPattern(username) && !sqliFixed
-                      ? "#fff5f5"
-                      : "white",
-                }}
-                type="text"
-                placeholder="Enter your username"
-                value={username}
-                onChange={(e) => {
-                  setUsername(e.target.value);
-                  setAttackBlocked(false);
-                }}
-                required
-              />
-              {/* Subtle injection hint for red team */}
-              {detectSqliPattern(username) && !sqliFixed && (
-                <div
-                  style={{
-                    fontSize: 11,
-                    color: "#ef4444",
-                    marginTop: 4,
-                    fontFamily: "monospace",
-                  }}
-                >
-                  ⚠ Injection pattern detected
-                </div>
-              )}
-            </div>
-
-            <div style={{ marginBottom: 28 }}>
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  marginBottom: 6,
-                }}
-              >
-                <label style={s.label}>Password</label>
-                <a
-                  href="#"
-                  style={{
-                    fontSize: 13,
-                    color: "#8a7f6e",
-                    textDecoration: "none",
-                  }}
-                >
-                  Forgot password?
-                </a>
-              </div>
-              <div style={s.inputWrapper}>
+                  Username
+                </label>
                 <input
-                  style={{ ...s.input, paddingRight: 60 }}
-                  type={showPassword ? "text" : "password"}
-                  placeholder="Enter your password"
-                  value={password}
+                  className={`login-input ${usernameInjection && !sqliFixed ? "danger" : "normal"}`}
+                  type="text"
+                  placeholder="Enter your username"
+                  value={username}
                   onChange={(e) => {
-                    setPassword(e.target.value);
+                    setUsername(e.target.value);
                     setAttackBlocked(false);
+                    setError("");
                   }}
                   required
                 />
-                <button
-                  type="button"
-                  style={s.toggleBtn}
-                  onClick={() => setShowPassword(!showPassword)}
-                >
-                  {showPassword ? "Hide" : "Show"}
-                </button>
+                {usernameInjection && !sqliFixed && (
+                  <div
+                    style={{
+                      marginTop: 5,
+                      fontSize: 11,
+                      color: "#ef4444",
+                      fontFamily: "monospace",
+                    }}
+                  >
+                    ⚠ Injection pattern detected
+                  </div>
+                )}
               </div>
-            </div>
 
-            <button
-              style={{ ...s.btn, opacity: loading ? 0.6 : 1 }}
-              type="submit"
-              disabled={loading}
-            >
-              {loading ? "Signing in..." : "Sign in"}
-            </button>
-          </form>
+              {/* Password */}
+              <div style={{ marginBottom: 32 }}>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    marginBottom: 8,
+                  }}
+                >
+                  <label
+                    style={{ fontSize: 13, fontWeight: 500, color: "#374151" }}
+                  >
+                    Password
+                  </label>
+                </div>
+                <div style={{ position: "relative" }}>
+                  <input
+                    className={`login-input ${passwordInjection && !sqliFixed ? "danger" : "normal"}`}
+                    style={{ paddingRight: 70 }}
+                    type={showPassword ? "text" : "password"}
+                    placeholder="Enter your password"
+                    value={password}
+                    onChange={(e) => {
+                      setPassword(e.target.value);
+                      setAttackBlocked(false);
+                      setError("");
+                    }}
+                    required
+                  />
+                  <button
+                    type="button"
+                    style={{
+                      position: "absolute",
+                      right: 12,
+                      top: "50%",
+                      transform: "translateY(-50%)",
+                      background: "none",
+                      border: "none",
+                      color: "#6b7280",
+                      fontSize: 13,
+                      fontWeight: 500,
+                      cursor: "pointer",
+                      padding: 4,
+                    }}
+                    onClick={() => setShowPassword(!showPassword)}
+                  >
+                    {showPassword ? "Hide" : "Show"}
+                  </button>
+                </div>
+                {passwordInjection && !sqliFixed && (
+                  <div
+                    style={{
+                      marginTop: 5,
+                      fontSize: 11,
+                      color: "#ef4444",
+                      fontFamily: "monospace",
+                    }}
+                  >
+                    ⚠ Injection pattern detected
+                  </div>
+                )}
+              </div>
 
-          {/* Security status strip */}
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              marginTop: 20,
-              padding: "10px 12px",
-              background: sqliFixed ? "#f0fdf4" : "#fafaf9",
-              border: `1px solid ${sqliFixed ? "#bbf7d0" : "#e8e5df"}`,
-              borderRadius: 8,
-            }}
-          >
+              <button className="login-btn" type="submit" disabled={loading}>
+                {loading ? (
+                  <>
+                    <svg
+                      style={{ animation: "spin 1s linear infinite" }}
+                      width="18"
+                      height="18"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                    >
+                      <circle
+                        cx="12"
+                        cy="12"
+                        r="10"
+                        stroke="rgba(255,255,255,0.3)"
+                        strokeWidth="3"
+                      />
+                      <path
+                        d="M12 2a10 10 0 0 1 10 10"
+                        stroke="white"
+                        strokeWidth="3"
+                        strokeLinecap="round"
+                      />
+                    </svg>
+                    Signing in...
+                  </>
+                ) : (
+                  "Sign in"
+                )}
+              </button>
+            </form>
+
+            {/* ── Security status strip ── */}
             <div
-              style={{
-                width: 7,
-                height: 7,
-                borderRadius: "50%",
-                background: sqliFixed ? "#16a34a" : "#d97706",
-                flexShrink: 0,
-              }}
-            />
-            <span
-              style={{
-                fontSize: 11,
-                color: sqliFixed ? "#15803d" : "#92400e",
-                fontFamily: "monospace",
-              }}
-            >
-              {sqliFixed
-                ? "SQL Injection: PATCHED (parameterized queries active)"
-                : "SQL Injection: VULNERABLE (string concatenation active)"}
-            </span>
-          </div>
-
-          <p
-            style={{
-              textAlign: "center",
-              marginTop: 20,
-              fontSize: 14,
-              color: "#8a7f6e",
-            }}
-          >
-            Don't have an account?{" "}
-            <Link
-              href="/register"
-              style={{
-                color: "#1a1a1a",
-                fontWeight: 600,
-                textDecoration: "none",
-              }}
-            >
-              Open one free
-            </Link>
-          </p>
-        </div>
-      </div>
-
-      {/* Right — brand panel */}
-      <div style={s.right}>
-        <div style={{ marginBottom: "auto", paddingBottom: 64 }}>
-          <div
-            style={{
-              fontFamily: "DM Serif Display, serif",
-              fontSize: 36,
-              color: "white",
-              lineHeight: 1.2,
-              letterSpacing: "-1px",
-              marginBottom: 24,
-            }}
-          >
-            Your money,
-            <br />
-            <em>your control.</em>
-          </div>
-          <p
-            style={{
-              color: "#8a7f6e",
-              fontSize: 15,
-              lineHeight: 1.7,
-              maxWidth: 320,
-            }}
-          >
-            Track balances, send transfers, and manage your finances from
-            anywhere — all in one place.
-          </p>
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-          {[
-            { n: "2M+", label: "Active customers" },
-            { n: "$14B", label: "Processed annually" },
-            { n: "99.98%", label: "Platform uptime" },
-          ].map((stat) => (
-            <div
-              key={stat.n}
               style={{
                 display: "flex",
                 alignItems: "center",
-                justifyContent: "space-between",
-                borderTop: "1px solid #2e2e2e",
-                paddingTop: 16,
+                gap: 8,
+                marginTop: 20,
+                padding: "9px 12px",
+                background: sqliFixed ? "#f0fdf4" : "#fafaf9",
+                border: `1px solid ${sqliFixed ? "#bbf7d0" : "#e8e5df"}`,
+                borderRadius: 8,
+                transition: "all 0.3s",
               }}
             >
-              <span style={{ color: "#8a7f6e", fontSize: 13 }}>
-                {stat.label}
-              </span>
+              <div
+                style={{
+                  width: 7,
+                  height: 7,
+                  borderRadius: "50%",
+                  background: sqliFixed ? "#16a34a" : "#d97706",
+                  flexShrink: 0,
+                }}
+              />
               <span
                 style={{
-                  color: "white",
-                  fontWeight: 700,
-                  fontSize: 18,
-                  letterSpacing: "-0.5px",
+                  fontSize: 11,
+                  color: sqliFixed ? "#15803d" : "#92400e",
+                  fontFamily: "monospace",
                 }}
               >
-                {stat.n}
+                {sqliFixed
+                  ? "SQL Injection: PATCHED (parameterized queries active)"
+                  : "SQL Injection: VULNERABLE (string concatenation active)"}
               </span>
             </div>
-          ))}
+
+            <p
+              style={{
+                textAlign: "center",
+                marginTop: 24,
+                fontSize: 14,
+                color: "#6b7280",
+              }}
+            >
+              Don't have an account?{" "}
+              <Link
+                href="/register"
+                style={{
+                  color: "#111827",
+                  fontWeight: 600,
+                  textDecoration: "none",
+                }}
+              >
+                Create one for free
+              </Link>
+            </p>
+          </div>
+        </div>
+
+        {/* ── Right panel ── */}
+        <div
+          className="right-panel"
+          style={{
+            flex: "1 1 50%",
+            background: "#09090b",
+            position: "relative",
+            overflow: "hidden",
+            display: "flex",
+            flexDirection: "column",
+            justifyContent: "space-between",
+            padding: 80,
+            color: "white",
+          }}
+        >
+          {/* Ambient gradients */}
+          <div
+            style={{
+              position: "absolute",
+              top: "-20%",
+              right: "-10%",
+              width: 600,
+              height: 600,
+              background:
+                "radial-gradient(circle, rgba(79,70,229,0.15) 0%, rgba(0,0,0,0) 70%)",
+              borderRadius: "50%",
+              pointerEvents: "none",
+            }}
+          />
+          <div
+            style={{
+              position: "absolute",
+              bottom: "-10%",
+              left: "-20%",
+              width: 500,
+              height: 500,
+              background:
+                "radial-gradient(circle, rgba(255,255,255,0.05) 0%, rgba(0,0,0,0) 70%)",
+              borderRadius: "50%",
+              pointerEvents: "none",
+            }}
+          />
+
+          <div
+            className="fade-in"
+            style={{
+              position: "relative",
+              zIndex: 1,
+              marginTop: "auto",
+              marginBottom: 64,
+            }}
+          >
+            <h2
+              style={{
+                fontSize: 48,
+                fontWeight: 600,
+                letterSpacing: "-0.04em",
+                lineHeight: 1.1,
+                marginBottom: 24,
+              }}
+            >
+              Your money, <br />
+              <span style={{ color: "#a1a1aa" }}>your control.</span>
+            </h2>
+            <p
+              style={{
+                color: "#a1a1aa",
+                fontSize: 18,
+                lineHeight: 1.6,
+                maxWidth: 400,
+                fontWeight: 400,
+              }}
+            >
+              Track balances, send transfers, and manage your finances from
+              anywhere — seamlessly integrated.
+            </p>
+          </div>
+
+          <div
+            className="fade-in"
+            style={{
+              position: "relative",
+              zIndex: 1,
+              display: "flex",
+              flexDirection: "column",
+              animationDelay: "0.2s",
+            }}
+          >
+            {[
+              { n: "2M+", label: "Active global customers" },
+              { n: "$14B", label: "Volume processed annually" },
+              { n: "99.99%", label: "Platform uptime" },
+            ].map((stat) => (
+              <div key={stat.n} className="stat-row">
+                <span
+                  style={{ color: "#a1a1aa", fontSize: 15, fontWeight: 500 }}
+                >
+                  {stat.label}
+                </span>
+                <span
+                  style={{
+                    color: "white",
+                    fontWeight: 600,
+                    fontSize: 22,
+                    letterSpacing: "-0.02em",
+                  }}
+                >
+                  {stat.n}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
       </div>
-    </div>
+    </>
   );
 }

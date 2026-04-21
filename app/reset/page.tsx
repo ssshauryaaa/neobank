@@ -84,8 +84,12 @@ export default function ResetPage() {
       });
     }
     sync();
+    window.addEventListener("storage", sync);
     const iv = setInterval(sync, 600);
-    return () => clearInterval(iv);
+    return () => {
+      clearInterval(iv);
+      window.removeEventListener("storage", sync);
+    };
   }, []);
 
   // Check server patch status on mount
@@ -103,10 +107,26 @@ export default function ResetPage() {
   async function resetSingle(key: VulnKey) {
     setResetState("resetting");
 
-    // Clear localStorage
+    // Always clear client-side first — this is what Login/Defense actually read
     localStorage.removeItem(PATCH_KEYS[key]);
+    setPatchState((prev) => ({ ...prev, [key]: false }));
 
-    // Clear server flag
+    // Also clear the real_attack_log entries for this type so defense re-shows them
+    try {
+      const existing = JSON.parse(
+        localStorage.getItem("real_attack_log") || "[]",
+      );
+      localStorage.setItem(
+        "real_attack_log",
+        JSON.stringify(
+          existing.filter((e: { type: string }) => e.type !== key),
+        ),
+      );
+    } catch {
+      /* ignore */
+    }
+
+    // Server call is best-effort only
     try {
       const targetMap: Record<VulnKey, string> = {
         sqli: "sqli",
@@ -121,10 +141,9 @@ export default function ResetPage() {
       });
       addLog(`${VULN_META[key].label} reset — vulnerability restored`, true);
     } catch {
-      addLog(`${VULN_META[key].label} — server flag may still be set`, false);
+      addLog(`${VULN_META[key].label} reset locally (server offline)`, true);
     }
 
-    setPatchState((prev) => ({ ...prev, [key]: false }));
     setResetState("idle");
     setConfirmTarget(null);
   }
@@ -132,23 +151,20 @@ export default function ResetPage() {
   async function resetAll() {
     setResetState("resetting");
 
-    // Clear all localStorage flags
+    // Clear everything client-side immediately
     Object.values(PATCH_KEYS).forEach((k) => localStorage.removeItem(k));
+    localStorage.removeItem("real_attack_log");
+    setPatchState({ sqli: false, jwt_forge: false, xss: false, idor: false });
 
-    // Clear server flags
     try {
       await fetch("/api/patch/reset", { method: "POST" });
       addLog("All vulnerabilities reset — system fully exploitable", true);
       setServerStatus("ok");
     } catch {
-      addLog(
-        "Server reset failed — localStorage cleared, server flags may persist",
-        false,
-      );
+      addLog("Reset locally (server offline) — all flags cleared", true);
       setServerStatus("error");
     }
 
-    setPatchState({ sqli: false, jwt_forge: false, xss: false, idor: false });
     setResetState("done");
     setConfirmTarget(null);
     setTimeout(() => setResetState("idle"), 2000);

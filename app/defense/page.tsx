@@ -40,47 +40,302 @@ type ScoreEntry = {
 };
 
 type ChallengeResult = "idle" | "running" | "pass" | "fail";
+type SqliFileTab = "route" | "page" | "diff";
 
-type Challenge = {
+type TwoFileSqliChallenge = {
+  kind: "two-file";
+  title: string;
+  description: string;
+  points: number;
+  routeStarterCode: string;
+  pageStarterCode: string;
+  routeVulnCode: string;
+  pageVulnCode: string;
+  routeHints: string[];
+  pageHints: string[];
+  validateRoute: (code: string) => { pass: boolean; feedback: string };
+  validatePage: (code: string) => { pass: boolean; feedback: string };
+};
+
+type SingleSnippetChallenge = {
+  kind: "single";
   title: string;
   description: string;
   points: number;
   vulnerableCode: string;
   starterCode: string;
   validate: (code: string) => { pass: boolean; feedback: string };
-  hint: string;
+  hints: string[];
 };
 
+type Challenge = TwoFileSqliChallenge | SingleSnippetChallenge;
+
+// ─── Full file content ───────────────────────────────────────────────────────
+const SQLI_ROUTE_STARTER = `import { NextRequest, NextResponse } from "next/server";
+import { getDb } from "../../../lib/db";
+import { signToken } from "../../../lib/auth";
+import { logAttack, detectSqli } from "../../../lib/logAttack";
+
+export async function POST(req: NextRequest) {
+  const { username, password } = await req.json();
+  const ip =
+    req.headers.get("x-forwarded-for") ??
+    req.headers.get("x-real-ip") ??
+    "unknown";
+
+  const sqliInUsername = detectSqli(username ?? "");
+  const sqliInPassword = detectSqli(password ?? "");
+
+  if (sqliInUsername || sqliInPassword) {
+    logAttack({
+      type: "sqli",
+      severity: "critical",
+      ip,
+      userId: null,
+      username: String(username),
+      detail: sqliInUsername
+        ? \`SQL injection in username field: "\${username}"\`
+        : \`SQL injection in password field: "\${password}"\`,
+      raw: { username, password, field: sqliInUsername ? "username" : "password" },
+    });
+  }
+
+  try {
+    const db = await getDb();
+
+    // 🔴 FIX THIS: string concatenation allows SQL injection
+    // Exploit: username = admin'--   or   ' OR '1'='1'--
+    const query = \`SELECT * FROM users WHERE username='\${username}' AND password='\${password}'\`;
+    const [rows]: any = await db.query(query);
+
+    if (!rows || rows.length === 0) {
+      return NextResponse.json(
+        { success: false, message: "Invalid username or password" },
+        { status: 401 }
+      );
+    }
+
+    const user = rows[0];
+
+    if (sqliInUsername || sqliInPassword) {
+      logAttack({
+        type: "sqli",
+        severity: "critical",
+        ip,
+        userId: String(user.id),
+        username: String(user.username),
+        detail: \`SQL injection login bypass SUCCEEDED — authenticated as "\${user.username}" (id=\${user.id})\`,
+        raw: { injected_query: query, authenticated_user: { id: user.id, username: user.username, role: user.role } },
+      });
+    }
+
+    const token = signToken({
+      id: user.id,
+      username: user.username,
+      role: user.role,
+      email: user.email,
+    });
+
+    const res = NextResponse.json({
+      success: true,
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        balance: user.balance,
+        account_number: user.account_number,
+      },
+    });
+
+    res.cookies.set("session", String(user.id), { path: "/" });
+    res.cookies.set("token", token, { path: "/" });
+    return res;
+
+  } catch (err: any) {
+    // 🔴 FIX THIS: never expose stack traces in production
+    return NextResponse.json(
+      { success: false, message: err.message, stack: err.stack },
+      { status: 500 }
+    );
+  }
+}`;
+
+const SQLI_PAGE_STARTER = `"use client";
+import { useState, useEffect } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+
+const PATCH_KEY = "patched_sqli";
+
+export default function LoginPage() {
+  const router = useRouter();
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [sqliFixed, setSqliFixed] = useState(false);
+  const [attackBlocked, setAttackBlocked] = useState(false);
+  const [lastAttack, setLastAttack] = useState<string | null>(null);
+
+  useEffect(() => {
+    const check = () => setSqliFixed(localStorage.getItem(PATCH_KEY) === "1");
+    check();
+    window.addEventListener("storage", check);
+    const iv = setInterval(check, 800);
+    return () => { clearInterval(iv); window.removeEventListener("storage", check); };
+  }, []);
+
+  function detectSqliPattern(val: string): boolean {
+    return (
+      /'\s*(or|and)\s*'?\d/i.test(val) ||
+      /'\s*or\s+1\s*=\s*1/i.test(val) ||
+      /'\s*or\s*'1'\s*=\s*'1/i.test(val) ||
+      /--[\s]/.test(val) || /--$/.test(val.trim()) ||
+      /'\s*--/.test(val) || /#/.test(val) ||
+      /union\s+select/i.test(val) ||
+      /;\s*(drop|alter|insert|select)/i.test(val)
+    );
+  }
+
+  function pushRealAttack(username: string, payload: string, succeeded: boolean) {
+    const entry = {
+      id: Math.random().toString(36).slice(2, 10).toUpperCase(),
+      ts: Date.now(),
+      type: "sqli",
+      severity: "critical",
+      ip: "REAL ATTACKER",
+      port: 443,
+      user: username || "anon",
+      detail: succeeded
+        ? \`✦ REAL ATTACK — Auth bypass SUCCEEDED via SQLi: "\${username}" authenticated as admin\`
+        : \`✦ REAL ATTACK — SQLi attempt detected in login form: "\${username}"\`,
+      endpoint: "/api/login",
+      method: "POST",
+      statusCode: succeeded ? 200 : 401,
+      userAgent: navigator.userAgent.slice(0, 60),
+      payload: \`username=\${payload}&password=<redacted>\`,
+      country: "LIVE",
+      patched: false, blocked: false, detected: false, restored: false,
+    };
+    try {
+      const existing = JSON.parse(localStorage.getItem("real_attack_log") || "[]");
+      existing.unshift(entry);
+      localStorage.setItem("real_attack_log", JSON.stringify(existing.slice(0, 50)));
+    } catch { /* ignore */ }
+  }
+
+  // 🔴 FIX THIS: the form currently submits even when sqliFixed=true and a
+  // payload is detected. Add client-side blocking: when sqliFixed && isInjection,
+  // set attackBlocked=true, call pushRealAttack(), and return early.
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError("");
+    setAttackBlocked(false);
+    setLastAttack(null);
+
+    const isInjection = detectSqliPattern(username) || detectSqliPattern(password);
+
+    // TODO: add your blocking logic here
+    if (isInjection) {
+      pushRealAttack(username, username, false);
+    }
+
+    try {
+      const res = await fetch("/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+      const data = await res.json();
+      setLoading(false);
+
+      if (data.success) {
+        if (isInjection) pushRealAttack(username, username, true);
+        localStorage.setItem("token", data.token);
+        localStorage.setItem("user", JSON.stringify(data.user));
+        document.cookie = \`session=\${data.user.id}; path=/\`;
+        router.push("/dashboard");
+      } else {
+        setError(
+          isInjection
+            ? "Invalid credentials. (Injection attempt logged.)"
+            : data.message || "Invalid username or password."
+        );
+      }
+    } catch {
+      setLoading(false);
+      setError("Something went wrong. Please try again.");
+    }
+  };
+
+  return (
+    <div>
+      {sqliFixed && (
+        <div style={{ background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: 12, padding: 16, marginBottom: 24 }}>
+          Protection Active — parameterized queries enabled
+        </div>
+      )}
+      {attackBlocked && (
+        <div style={{ background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 12, padding: 16, marginBottom: 24 }}>
+          Threat Intercepted — payload blocked: <code>{lastAttack}</code>
+        </div>
+      )}
+      <form onSubmit={handleLogin}>
+        <input value={username} onChange={e => { setUsername(e.target.value); setAttackBlocked(false); setError(""); }} placeholder="Username" required />
+        <input type={showPassword ? "text" : "password"} value={password} onChange={e => { setPassword(e.target.value); setAttackBlocked(false); setError(""); }} placeholder="Password" required />
+        <button type="submit" disabled={loading}>{loading ? "Signing in..." : "Sign in"}</button>
+      </form>
+      {error && <div>{error}</div>}
+    </div>
+  );
+}`;
+
+// ─── Challenges map ───────────────────────────────────────────────────────────
 const CHALLENGES: Partial<Record<AttackType, Challenge>> = {
   sqli: {
-    title: "Fix: SQL Injection in Login Route",
+    kind: "two-file",
+    title: "Fix SQL Injection — API route & login page",
     description:
-      "The login endpoint builds queries via string concatenation, allowing attackers to bypass authentication with admin'-- or ' OR '1'='1'--. Replace with a parameterized prepared statement.",
+      "The login API builds queries via string concatenation, letting attackers bypass auth with payloads like admin'-- or ' OR '1'='1'--. Fix the route to use parameterized queries, remove the stack trace leak, and add client-side blocking in the login page.",
     points: 120,
-    vulnerableCode: `// ❌ VULNERABLE — string concatenation
+    routeStarterCode: SQLI_ROUTE_STARTER,
+    pageStarterCode: SQLI_PAGE_STARTER,
+    routeVulnCode: `// ❌ VULNERABLE — string concatenation
 const query = \`SELECT * FROM users
   WHERE username='\${username}'
   AND password='\${password}'\`;
-const [rows] = await db.query(query);`,
-    starterCode: `// ✅ YOUR FIX — use parameterized queries
-const query = "SELECT * FROM users WHERE username=? AND password=?";
-const [rows] = await db.query(query, [/* your params here */]);`,
-    validate: (code) => {
-      const stillVulnerable =
+const [rows]: any = await db.query(query);`,
+    pageVulnCode: `// ❌ VULNERABLE — no client-side blocking when patched
+// handleLogin submits even when sqliFixed=true and injection detected.`,
+    routeHints: [
+      "Replace the template literal with a parameterized query using ? placeholders:",
+      `const query = "SELECT * FROM users WHERE username=? AND password=?";\nconst [rows]: any = await db.query(query, [username, password]);`,
+      "Also remove stack: err.stack from the catch block — never expose stack traces in production.",
+    ],
+    pageHints: [
+      "Inside handleLogin, right after computing isInjection, add an early return when the patch is active:",
+      `if (sqliFixed && isInjection) {\n  setLoading(false);\n  setAttackBlocked(true);\n  setLastAttack(username || password);\n  pushRealAttack(username, username, false);\n  return;\n}`,
+    ],
+    validateRoute: (code) => {
+      const stillTemplate =
         /`[^`]*\$\{username\}[^`]*`/.test(code) ||
         /`[^`]*\$\{password\}[^`]*`/.test(code);
       const hasPlaceholder =
         /WHERE username\s*=\s*\?/.test(code.replace(/\s+/g, " ")) ||
         /\?.*AND.*\?/.test(code.replace(/\s+/g, " "));
-      const hasParams = /\[\s*(username|password)/.test(code);
-      const usesConcat = /'\s*\+\s*(username|password)/.test(code);
-      if (usesConcat)
+      const hasParams = /db\.query\s*\([^,]+,\s*\[/.test(code);
+      const hasConcat = /'\s*\+\s*(username|password)/.test(code);
+      const hasStackLeak = /stack:\s*err\.stack/.test(code);
+      if (hasConcat)
         return {
           pass: false,
-          feedback:
-            "❌ Still concatenating strings — use ? placeholders instead.",
+          feedback: "❌ Still concatenating strings — use ? placeholders.",
         };
-      if (stillVulnerable)
+      if (stillTemplate)
         return {
           pass: false,
           feedback:
@@ -98,14 +353,52 @@ const [rows] = await db.query(query, [/* your params here */]);`,
           feedback:
             "❌ Pass [username, password] as the second argument to db.query().",
         };
+      if (hasStackLeak)
+        return {
+          pass: false,
+          feedback:
+            "❌ Still leaking err.stack in the error response — remove it.",
+        };
       return {
         pass: true,
-        feedback: "✅ Correct! Parameterized queries separate data from code.",
+        feedback:
+          "✅ Route fixed! Parameterized query active, no stack trace leak.",
       };
     },
-    hint: 'Change the query to "SELECT * FROM users WHERE username=? AND password=?" and call db.query(query, [username, password]).',
+    validatePage: (code) => {
+      const hasBlockCheck =
+        /sqliFixed\s*&&\s*isInjection/.test(code) ||
+        /isInjection\s*&&\s*sqliFixed/.test(code);
+      const hasSetBlocked = /setAttackBlocked\s*\(\s*true\s*\)/.test(code);
+      const hasPushAttack = /pushRealAttack/.test(code);
+      if (!hasBlockCheck)
+        return {
+          pass: false,
+          feedback:
+            "❌ Missing if (sqliFixed && isInjection) check in handleLogin.",
+        };
+      if (!hasSetBlocked)
+        return {
+          pass: false,
+          feedback:
+            "❌ Need to call setAttackBlocked(true) and return early when blocked.",
+        };
+      if (!hasPushAttack)
+        return {
+          pass: false,
+          feedback:
+            "❌ Call pushRealAttack() to log the blocked attempt to the defense console.",
+        };
+      return {
+        pass: true,
+        feedback:
+          "✅ Page fixed! Client blocks and logs injection attempts when patched.",
+      };
+    },
   },
+
   jwt_forge: {
+    kind: "single",
     title: "Fix: Weak JWT Verification",
     description:
       'The auth library accepts alg:"none" and uses a weak hardcoded secret. Fix jwt.verify() to enforce HS256 only and remove the fallback "secret".',
@@ -154,9 +447,15 @@ export function getUserFromToken(token: string) {
           "✅ Correct! Restricting to HS256 prevents algorithm confusion and alg:none attacks.",
       };
     },
-    hint: 'Add algorithms: ["HS256"] to the options and remove the || "secret" fallback.',
+    hints: [
+      'Add algorithms: ["HS256"] to the jwt.verify() options object.',
+      'Remove the || "secret" fallback — use process.env.JWT_SECRET! (the ! asserts it is defined).',
+      `The fixed call looks like:\njwt.verify(token, process.env.JWT_SECRET!, {\n  algorithms: ["HS256"],\n});`,
+    ],
   },
+
   xss: {
+    kind: "single",
     title: "Fix: Stored XSS via dangerouslySetInnerHTML",
     description:
       "The transfer page renders user data via dangerouslySetInnerHTML, allowing script injection. Replace with safe React text rendering.",
@@ -204,9 +503,15 @@ export function getUserFromToken(token: string) {
           "✅ Correct! JSX auto-escapes text nodes, preventing script injection.",
       };
     },
-    hint: "Remove dangerouslySetInnerHTML and render values as {lastTransfer.note} and {u.username}.",
+    hints: [
+      "Remove dangerouslySetInnerHTML entirely — it is almost never the right tool.",
+      "React automatically escapes text when you write it as a JSX expression: {value}",
+      `Replace the dangerous divs with:\n<div>\n  Transfer to <b>{lastTransfer.toAccount}</b> completed.\n  Note: {lastTransfer.note}\n</div>\n<div>{u.username}</div>`,
+    ],
   },
+
   idor: {
+    kind: "single",
     title: "Fix: IDOR in User Data Endpoint",
     description:
       "The /api/user route returns any user whose ID appears in the JWT without ownership verification. Add server-side checks and parameterize the query.",
@@ -268,10 +573,15 @@ export async function GET(req: NextRequest) {
           "✅ Correct! Server-side ownership checks prevent IDOR even with forged JWTs.",
       };
     },
-    hint: "Use db.query('...WHERE id = ?', [decoded.id]) and return { status: 403, message: 'Forbidden' } if user.id !== decoded.id.",
+    hints: [
+      "Use a parameterized query: db.query('SELECT * FROM users WHERE id = ?', [decoded.id])",
+      "After fetching the user, compare user.id to decoded.id — they must match.",
+      `Add an ownership check:\nif (!user || user.id !== decoded.id) {\n  return NextResponse.json(\n    { success: false, message: 'Forbidden' },\n    { status: 403 }\n  );\n}`,
+    ],
   },
 };
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function uid() {
   return Math.random().toString(36).slice(2, 10).toUpperCase();
 }
@@ -465,6 +775,37 @@ const TYPE_COLORS: Record<
   xss: { text: "#c2410c", bg: "#fff7ed", border: "#fed7aa" },
 };
 
+// ─── Styles ───────────────────────────────────────────────────────────────────
+const mono = "'JetBrains Mono', 'Fira Code', monospace";
+const sans = "'IBM Plex Sans', system-ui, sans-serif";
+
+// Challenge modal palette (dark)
+// Challenge modal palette (Cyber-Arena / Glassmorphism)
+// Challenge modal palette (Professional Dark Glass)
+// Clean, Professional SaaS Palette
+const C = {
+  bg0: "#09090b", // Deepest background
+  bg1: "#18181b", // Card/Modal background
+  bg2: "#27272a", // Elevated surfaces
+  bg3: "#3f3f46", // UI element background
+  border: "#27272a", // Subtle borders
+  border2: "#3f3f46", // Stronger borders
+  green: "#10b981", // Professional emerald
+  greenDim: "rgba(16, 185, 129, 0.1)",
+  greenBorder: "rgba(16, 185, 129, 0.2)",
+  red: "#ef4444", // Clean danger red
+  redDim: "rgba(239, 68, 68, 0.1)",
+  amber: "#f59e0b", // Warning amber
+  amberDim: "rgba(245, 158, 11, 0.1)",
+  purple: "#8b5cf6", // Accent violet
+  blue: "#3b82f6", // Primary blue
+  text0: "#fafafa", // Primary text
+  text1: "#a1a1aa", // Secondary text
+  text2: "#71717a", // Tertiary text
+  text3: "#52525b", // Muted text
+};
+
+// ─── Main Component ───────────────────────────────────────────────────────────
 export default function DefensePage() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -480,12 +821,23 @@ export default function DefensePage() {
   // Challenge modal state
   const [challengeOpen, setChallengeOpen] = useState(false);
   const [challengeType, setChallengeType] = useState<AttackType | null>(null);
-  const [challengeCode, setChallengeCode] = useState("");
   const [challengeResult, setChallengeResult] =
     useState<ChallengeResult>("idle");
+
+  // Single-snippet state
+  const [challengeCode, setChallengeCode] = useState("");
   const [challengeFeedback, setChallengeFeedback] = useState("");
   const [showHint, setShowHint] = useState(false);
-  const [showVulnerable, setShowVulnerable] = useState(false);
+
+  // Two-file SQLi state
+  const [sqliActiveTab, setSqliActiveTab] = useState<SqliFileTab>("route");
+  const [sqliRouteCode, setSqliRouteCode] = useState("");
+  const [sqliPageCode, setSqliPageCode] = useState("");
+  const [sqliRouteOk, setSqliRouteOk] = useState(false);
+  const [sqliPageOk, setSqliPageOk] = useState(false);
+  const [sqliRouteFeedback, setSqliRouteFeedback] = useState("");
+  const [sqliPageFeedback, setSqliPageFeedback] = useState("");
+  const [sqliShowHint, setSqliShowHint] = useState(false);
 
   const toastTimer = useRef<NodeJS.Timeout | null>(null);
   const seenRealIds = useRef<Set<string>>(new Set());
@@ -495,7 +847,7 @@ export default function DefensePage() {
     patchedTypesRef.current = patchedTypes;
   }, [patchedTypes]);
 
-  // Poll real attack log from other pages
+  // Poll real attack log
   useEffect(() => {
     const poll = setInterval(() => {
       try {
@@ -575,7 +927,6 @@ export default function DefensePage() {
     setLogs((prev) =>
       prev.map((l) => (l.id === logId ? { ...l, detected: true } : l)),
     );
-    // No points for acknowledging
     showToast("Threat acknowledged — now deploy a hotfix to score");
   }
 
@@ -591,22 +942,25 @@ export default function DefensePage() {
       return;
     }
     const ch = CHALLENGES[log.type];
-    if (ch) {
-      setChallengeType(log.type);
+    if (!ch) return;
+    setChallengeType(log.type);
+    setChallengeResult("idle");
+    setChallengeOpen(true);
+    setShowHint(false);
+    setChallengeFeedback("");
+    if (ch.kind === "two-file") {
+      setSqliActiveTab("route");
+      setSqliRouteCode(ch.routeStarterCode);
+      setSqliPageCode(ch.pageStarterCode);
+      setSqliRouteOk(false);
+      setSqliPageOk(false);
+      setSqliRouteFeedback("");
+      setSqliPageFeedback("");
+      setSqliShowHint(false);
+    } else {
       setChallengeCode(ch.starterCode);
-      setChallengeResult("idle");
-      setChallengeOpen(true);
-      setShowHint(false);
-      setShowVulnerable(false);
-      setChallengeFeedback("");
     }
   }
-
-  // ── Drop this into your DefensePage's submitChallenge() function ──────────
-  // Replace the existing submitChallenge() with this version.
-  // The only addition is the fetch() call to /api/patch after a pass,
-  // which writes a server-side flag file so the API routes also switch
-  // to parameterized queries.
 
   const PATCH_TARGET_MAP: Partial<Record<AttackType, string>> = {
     sqli: "sqli",
@@ -615,59 +969,63 @@ export default function DefensePage() {
     idor: "idor",
   };
 
-  function submitChallenge() {
-    if (!challengeType || !challenge) return;
-    setChallengeResult("running");
+  function applyPatch(type: AttackType, points: number) {
+    setLogs((prev) =>
+      prev.map((l) => (l.type === type ? { ...l, patched: true } : l)),
+    );
+    setPatchedTypes((prev) => new Set([...prev, type]));
+    const lsKey = PATCH_KEYS[type];
+    if (lsKey) localStorage.setItem(lsKey, "1");
+    const apiTarget = PATCH_TARGET_MAP[type];
+    if (apiTarget) {
+      fetch("/api/patch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target: apiTarget, action: "apply" }),
+      }).catch(() => console.warn("[patch] Server-side flag write failed"));
+    }
+    setScore((s) => s + points);
+    setScoreHistory((h) =>
+      [
+        {
+          points,
+          ts: Date.now(),
+          detail: `${TYPE_LABELS[type]} patched globally`,
+          type,
+        },
+        ...h,
+      ].slice(0, 30),
+    );
+  }
 
+  function submitChallenge() {
+    if (!challengeType || !challenge || challenge.kind !== "single") return;
+    setChallengeResult("running");
     setTimeout(() => {
       const result = challenge.validate(challengeCode);
       setChallengeResult(result.pass ? "pass" : "fail");
       setChallengeFeedback(result.feedback);
+      if (result.pass) applyPatch(challengeType, challenge.points);
+    }, 700);
+  }
 
-      if (result.pass) {
-        // 1. Mark all logs of this type as patched in UI
-        setLogs((prev) =>
-          prev.map((l) =>
-            l.type === challengeType ? { ...l, patched: true } : l,
-          ),
-        );
-
-        // 2. Add to patched set so new attacks stop spawning
-        setPatchedTypes((prev) => new Set([...prev, challengeType]));
-
-        // 3. Write localStorage key so other pages (login, search, profile) show banners
-        const lsKey = PATCH_KEYS[challengeType];
-        if (lsKey) localStorage.setItem(lsKey, "1");
-
-        // 4. ── NEW: Write server-side flag so API routes switch to safe queries ──
-        const apiTarget = PATCH_TARGET_MAP[challengeType];
-        if (apiTarget) {
-          fetch("/api/patch", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ target: apiTarget, action: "apply" }),
-          }).catch(() => {
-            // Non-critical — client-side patch still works even if this fails
-            console.warn(
-              "[patch] Server-side flag write failed — client-side patch still active",
-            );
-          });
-        }
-
-        // 5. Award points and update ledger
-        const pts = challenge.points;
-        setScore((s) => s + pts);
-        setScoreHistory((h) =>
-          [
-            {
-              points: pts,
-              ts: Date.now(),
-              detail: `${TYPE_LABELS[challengeType]} patched globally`,
-              type: challengeType,
-            },
-            ...h,
-          ].slice(0, 30),
-        );
+  function submitSqliChallenge() {
+    if (!challengeType || !challenge || challenge.kind !== "two-file") return;
+    setChallengeResult("running");
+    setTimeout(() => {
+      const rv = challenge.validateRoute(sqliRouteCode);
+      const pv = challenge.validatePage(sqliPageCode);
+      setSqliRouteFeedback(rv.feedback);
+      setSqliPageFeedback(pv.feedback);
+      setSqliRouteOk(rv.pass);
+      setSqliPageOk(pv.pass);
+      if (rv.pass && pv.pass) {
+        setChallengeResult("pass");
+        applyPatch(challengeType, challenge.points);
+      } else {
+        setChallengeResult("fail");
+        if (!rv.pass) setSqliActiveTab("route");
+        else if (!pv.pass) setSqliActiveTab("page");
       }
     }, 700);
   }
@@ -678,7 +1036,11 @@ export default function DefensePage() {
     setChallengeResult("idle");
     setChallengeFeedback("");
     setShowHint(false);
-    setShowVulnerable(false);
+    setSqliRouteFeedback("");
+    setSqliPageFeedback("");
+    setSqliRouteOk(false);
+    setSqliPageOk(false);
+    setSqliShowHint(false);
   }
 
   const fmt = (ts: number) =>
@@ -696,14 +1058,12 @@ export default function DefensePage() {
   const critCount = logs.filter(
     (l) => l.severity === "critical" && !patchedTypes.has(l.type),
   ).length;
-
   const filteredLogs = logs.filter((l) => {
     const isGP = patchedTypes.has(l.type);
     if (filterTab === "acknowledged") return l.detected && !isGP;
     if (filterTab === "fixed") return isGP;
     return true;
   });
-
   const tabCounts = {
     all: logs.length,
     acknowledged: logs.filter((l) => l.detected && !patchedTypes.has(l.type))
@@ -711,10 +1071,1204 @@ export default function DefensePage() {
     fixed: logs.filter((l) => patchedTypes.has(l.type)).length,
   };
 
-  // ── Styles ────────────────────────────────────────────────────────────────
-  const mono = "'JetBrains Mono', 'Fira Code', monospace";
-  const sans = "'IBM Plex Sans', system-ui, sans-serif";
+  // ─── Diff view for SQLi route ────────────────────────────────────────────
+  function renderSqliDiff(ch: TwoFileSqliChallenge) {
+    const lines = ch.routeStarterCode.split("\n");
+    const badPattern =
+      /`SELECT \* FROM users|WHERE username='\$\{|AND password='\$\{|stack:\s*err\.stack/;
+    const fixLines = [
+      '    const query = "SELECT * FROM users WHERE username=? AND password=?";',
+      "    const [rows]: any = await db.query(query, [username, password]);",
+      "",
+      "    // Error handler — no stack leak:",
+      "    return NextResponse.json(",
+      "      { success: false, message: err.message },",
+      "      { status: 500 }",
+      "    );",
+    ];
+    return (
+      <div style={{ flex: 1, overflowY: "auto", background: C.bg0 }}>
+        <div
+          style={{
+            padding: "10px 20px",
+            fontSize: 10,
+            fontWeight: 700,
+            letterSpacing: ".1em",
+            color: C.red,
+            borderBottom: `1px solid rgba(248,113,113,0.15)`,
+            background: "rgba(248,113,113,0.04)",
+          }}
+        >
+          VULNERABLE LINES (highlighted) — route.ts
+        </div>
+        <div style={{ fontFamily: mono, fontSize: 12, lineHeight: 1.8 }}>
+          {lines.map((line, i) => {
+            const isBad = badPattern.test(line);
+            return (
+              <div
+                key={i}
+                style={{ display: "grid", gridTemplateColumns: "44px 1fr" }}
+              >
+                <span
+                  style={{
+                    color: C.text3,
+                    padding: "0 12px",
+                    textAlign: "right",
+                    userSelect: "none",
+                    fontSize: 11,
+                  }}
+                >
+                  {i + 1}
+                </span>
+                <span
+                  style={{
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-all",
+                    paddingRight: 20,
+                    background: isBad
+                      ? "rgba(248,113,113,0.13)"
+                      : "transparent",
+                    color: isBad ? "#fca5a5" : C.text2,
+                  }}
+                >
+                  {line || " "}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        <div
+          style={{
+            padding: "10px 20px",
+            fontSize: 10,
+            fontWeight: 700,
+            letterSpacing: ".1em",
+            color: C.green,
+            borderTop: `1px solid rgba(74,222,128,0.15)`,
+            borderBottom: `1px solid rgba(74,222,128,0.15)`,
+            marginTop: 12,
+            background: "rgba(74,222,128,0.04)",
+          }}
+        >
+          REQUIRED FIX — replace the red lines with these
+        </div>
+        <div
+          style={{
+            fontFamily: mono,
+            fontSize: 12,
+            lineHeight: 1.8,
+            paddingBottom: 20,
+          }}
+        >
+          {fixLines.map((line, i) => (
+            <div
+              key={i}
+              style={{ display: "grid", gridTemplateColumns: "44px 1fr" }}
+            >
+              <span
+                style={{
+                  color: C.green,
+                  padding: "0 12px",
+                  textAlign: "right",
+                  opacity: 0.5,
+                  fontSize: 11,
+                }}
+              >
+                +
+              </span>
+              <span
+                style={{
+                  whiteSpace: "pre-wrap",
+                  color: "#86efac",
+                  background: "rgba(74,222,128,0.08)",
+                  paddingRight: 20,
+                }}
+              >
+                {line || " "}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
 
+  // ─── Hint panel content ───────────────────────────────────────────────────
+  function renderHints(hints: string[]) {
+    // hints array: [prose line, optional code block, prose line, ...]
+    return (
+      <div
+        style={{
+          padding: "14px 20px",
+          background: "rgba(251,191,36,0.06)",
+          borderBottom: `1px solid rgba(251,191,36,0.15)`,
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 7,
+            marginBottom: 12,
+          }}
+        >
+          <span style={{ fontSize: 13 }}>💡</span>
+          <span
+            style={{
+              fontSize: 10,
+              fontWeight: 700,
+              letterSpacing: ".12em",
+              color: C.amber,
+            }}
+          >
+            HINT
+          </span>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {hints.map((h, i) => {
+            // If the hint contains a newline it's a code snippet
+            const isCode = h.includes("\n");
+            return isCode ? (
+              <pre
+                key={i}
+                style={{
+                  margin: 0,
+                  padding: "10px 14px",
+                  background: "rgba(251,191,36,0.08)",
+                  border: "1px solid rgba(251,191,36,0.18)",
+                  borderRadius: 6,
+                  fontFamily: mono,
+                  fontSize: 12,
+                  color: "#e8c46a",
+                  lineHeight: 1.75,
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-all",
+                }}
+              >
+                {h}
+              </pre>
+            ) : (
+              <p
+                key={i}
+                style={{
+                  margin: 0,
+                  fontSize: 13,
+                  color: "#d4a847",
+                  lineHeight: 1.6,
+                }}
+              >
+                {h}
+              </p>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Right sidebar — challenge board & effects ────────────────────────────
+  function renderRightPane(ch: Challenge, isTwoFile: boolean) {
+    const bothPass = sqliRouteOk && sqliPageOk;
+    const singlePass = challengeResult === "pass";
+    const isPassed = isTwoFile ? bothPass : singlePass;
+
+    return (
+      <div
+        style={{
+          width: 300,
+          flexShrink: 0,
+          display: "flex",
+          flexDirection: "column",
+          borderLeft: `1px solid ${C.border}`,
+          background: C.bg1,
+        }}
+      >
+        {/* Run validator */}
+        <div style={{ padding: "20px 20px 0", flexShrink: 0 }}>
+          {/* Inside renderRightPane: */}
+          <button
+            onClick={isTwoFile ? submitSqliChallenge : submitChallenge}
+            disabled={challengeResult === "running" || isPassed}
+            style={{
+              fontFamily: sans,
+              width: "100%",
+              padding: "12px 0",
+              borderRadius: 6,
+              fontSize: 14,
+              fontWeight: 600,
+              border: "1px solid transparent",
+              cursor: isPassed
+                ? "default"
+                : challengeResult === "running"
+                  ? "wait"
+                  : "pointer",
+              transition: "all .15s ease",
+              background: isPassed
+                ? C.greenDim
+                : challengeResult === "running"
+                  ? C.bg3
+                  : C.text0,
+              color: isPassed
+                ? C.green
+                : challengeResult === "running"
+                  ? C.text2
+                  : C.bg0,
+              borderColor: isPassed ? C.greenBorder : "transparent",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 8,
+            }}
+          >
+            {challengeResult === "running"
+              ? "Validating..."
+              : isPassed
+                ? "✓ System Secured"
+                : "Deploy Hotfix"}
+          </button>
+          {/* Single result feedback */}
+          {!isTwoFile && challengeFeedback && (
+            <div
+              style={{
+                marginTop: 12,
+                padding: "11px 14px",
+                borderRadius: 8,
+                fontSize: 12,
+                lineHeight: 1.65,
+                ...(singlePass
+                  ? {
+                      background: C.greenDim,
+                      border: `1px solid ${C.greenBorder}`,
+                      color: C.green,
+                    }
+                  : {
+                      background: C.redDim,
+                      border: `1px solid rgba(248,113,113,0.25)`,
+                      color: C.red,
+                    }),
+              }}
+            >
+              {challengeFeedback}
+            </div>
+          )}
+          {/* Two-file status cards */}
+          {isTwoFile && (
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: 8,
+                marginTop: 14,
+              }}
+            >
+              {(["route", "page"] as const).map((f) => {
+                const ok = f === "route" ? sqliRouteOk : sqliPageOk;
+                const fb = f === "route" ? sqliRouteFeedback : sqliPageFeedback;
+                const label = f === "route" ? "route.ts" : "page.tsx";
+                const dotColor = f === "route" ? C.purple : C.blue;
+                const status = ok ? "fixed" : fb ? "needs fix" : "pending";
+                return (
+                  <div
+                    key={f}
+                    style={{
+                      background: C.bg0,
+                      borderRadius: 8,
+                      border: `1px solid ${ok ? C.greenBorder : fb ? "rgba(248,113,113,0.2)" : C.border}`,
+                      padding: "10px 13px",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                    }}
+                  >
+                    <div
+                      style={{ display: "flex", alignItems: "center", gap: 8 }}
+                    >
+                      <div
+                        style={{
+                          width: 7,
+                          height: 7,
+                          borderRadius: "50%",
+                          background: dotColor,
+                        }}
+                      />
+                      <span
+                        style={{
+                          fontSize: 12,
+                          color: C.text1,
+                          fontFamily: mono,
+                        }}
+                      >
+                        {label}
+                      </span>
+                    </div>
+                    <span
+                      style={{
+                        fontSize: 10,
+                        fontWeight: 700,
+                        letterSpacing: ".05em",
+                        padding: "2px 8px",
+                        borderRadius: 4,
+                        color: ok ? C.green : fb ? C.red : C.text3,
+                        background: ok ? C.greenDim : fb ? C.redDim : C.bg3,
+                      }}
+                    >
+                      {status}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* Divider */}
+        <div style={{ height: 1, background: C.border, margin: "18px 0 0" }} />
+
+        {/* Scrollable bottom */}
+        <div style={{ flex: 1, overflowY: "auto", padding: "16px 20px" }}>
+          {/* Success card */}
+          {isPassed && (
+            <div
+              style={{
+                padding: "14px 16px",
+                borderRadius: 10,
+                background: C.greenDim,
+                border: `1px solid ${C.greenBorder}`,
+                marginBottom: 20,
+              }}
+            >
+              <div
+                style={{
+                  fontSize: 11,
+                  fontWeight: 700,
+                  color: C.green,
+                  letterSpacing: ".06em",
+                  marginBottom: 5,
+                }}
+              >
+                ✓ VULNERABILITY CLOSED
+              </div>
+              <div style={{ fontSize: 12, color: "#86efac", lineHeight: 1.6 }}>
+                {challengeType ? TYPE_LABELS[challengeType] : ""} attacks
+                halted.
+                {challengeType === "sqli" && " Login page is now protected."}
+                {challengeType === "jwt_forge" &&
+                  " Profile page blocks forge attempts."}
+              </div>
+            </div>
+          )}
+
+          {/* Effects */}
+          <div
+            style={{
+              fontSize: 10,
+              fontWeight: 700,
+              letterSpacing: ".12em",
+              color: C.text3,
+              marginBottom: 14,
+            }}
+          >
+            ON PASS — EFFECTS
+          </div>
+          {[
+            {
+              icon: "🛡",
+              text: (
+                <>
+                  All{" "}
+                  <strong style={{ color: C.text1 }}>
+                    {challengeType ? TYPE_LABELS[challengeType] : ""}
+                  </strong>{" "}
+                  logs marked fixed
+                </>
+              ),
+            },
+            { icon: "⛔", text: "New attacks of this type stop spawning" },
+            ...(challengeType === "sqli"
+              ? [
+                  {
+                    icon: "🔒",
+                    text: "Login page activates its patch banner live",
+                  },
+                ]
+              : []),
+            ...(challengeType === "jwt_forge"
+              ? [
+                  {
+                    icon: "🔒",
+                    text: "Profile page blocks forge attempts live",
+                  },
+                ]
+              : []),
+            {
+              icon: "⭐",
+              text: (
+                <>
+                  <strong style={{ color: C.green }}>+{ch.points} pts</strong>{" "}
+                  added to your score
+                </>
+              ),
+            },
+          ].map((item, i) => (
+            <div
+              key={i}
+              style={{
+                display: "flex",
+                gap: 11,
+                alignItems: "flex-start",
+                marginBottom: 12,
+              }}
+            >
+              <div
+                style={{
+                  width: 24,
+                  height: 24,
+                  borderRadius: 6,
+                  background: C.bg3,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  flexShrink: 0,
+                  fontSize: 12,
+                }}
+              >
+                {item.icon}
+              </div>
+              <span
+                style={{
+                  fontSize: 12,
+                  color: C.text2,
+                  lineHeight: 1.55,
+                  paddingTop: 3,
+                }}
+              >
+                {item.text}
+              </span>
+            </div>
+          ))}
+
+          {/* Challenge board */}
+          <div style={{ marginTop: 20 }}>
+            <div
+              style={{
+                fontSize: 10,
+                fontWeight: 700,
+                letterSpacing: ".12em",
+                color: C.text3,
+                marginBottom: 12,
+              }}
+            >
+              CHALLENGE BOARD
+            </div>
+            {Object.entries(CHALLENGES).map(([type, c]) => {
+              const done = patchedTypes.has(type as AttackType);
+              const tc = TYPE_COLORS[type as AttackType];
+              const isCurrent = type === challengeType;
+              return (
+                <div
+                  key={type}
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    padding: "10px 0",
+                    borderBottom: `1px solid ${C.border}`,
+                    opacity: done && !isCurrent ? 0.4 : 1,
+                  }}
+                >
+                  <div
+                    style={{ display: "flex", alignItems: "center", gap: 8 }}
+                  >
+                    {done && (
+                      <span style={{ fontSize: 10, color: C.green }}>✓</span>
+                    )}
+                    <span
+                      style={{
+                        fontSize: 11,
+                        fontWeight: 700,
+                        color: done ? C.green : isCurrent ? tc.text : C.text2,
+                      }}
+                    >
+                      {TYPE_LABELS[type as AttackType]}
+                    </span>
+                    {isCurrent && !done && (
+                      <span
+                        style={{
+                          fontSize: 9,
+                          fontWeight: 700,
+                          padding: "1px 6px",
+                          borderRadius: 3,
+                          background: "rgba(74,222,128,0.1)",
+                          color: C.green,
+                          letterSpacing: ".06em",
+                        }}
+                      >
+                        ACTIVE
+                      </span>
+                    )}
+                  </div>
+                  <span
+                    style={{
+                      fontSize: 12,
+                      fontWeight: 800,
+                      fontFamily: mono,
+                      color: done ? C.green : C.text3,
+                    }}
+                  >
+                    +{c!.points}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Two-file SQLi modal ──────────────────────────────────────────────────
+  // ─── Two-file SQLi modal ──────────────────────────────────────────────────
+  // ─── Two-file SQLi modal ──────────────────────────────────────────────────
+  function renderSqliModal(ch: TwoFileSqliChallenge) {
+    const activeHints =
+      sqliActiveTab === "route"
+        ? ch.routeHints
+        : sqliActiveTab === "page"
+          ? ch.pageHints
+          : [];
+    const activeRouteFeedback = sqliRouteFeedback && sqliActiveTab === "route";
+    const activePageFeedback = sqliPageFeedback && sqliActiveTab === "page";
+
+    return (
+      <div
+        style={{
+          width: "100%",
+          maxWidth: 1100,
+          background: C.bg1,
+          border: `1px solid ${C.border}`,
+          boxShadow: "0 25px 50px -12px rgba(0, 0, 0, 0.5)",
+          borderRadius: 12,
+          display: "flex",
+          flexDirection: "column",
+          maxHeight: "90vh",
+          overflow: "hidden",
+        }}
+      >
+        {/* Header - Clean SaaS Style */}
+        <div
+          style={{
+            padding: "24px 32px",
+            borderBottom: `1px solid ${C.border}`,
+            background: C.bg1,
+            flexShrink: 0,
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-start",
+            gap: 20,
+          }}
+        >
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                marginBottom: 16,
+                flexWrap: "wrap",
+              }}
+            >
+              <span
+                style={{
+                  fontSize: 11,
+                  fontWeight: 600,
+                  padding: "4px 10px",
+                  borderRadius: 6,
+                  color: C.text0,
+                  background: C.bg3,
+                  border: `1px solid ${C.border2}`,
+                }}
+              >
+                Hotfix Required
+              </span>
+              <span
+                style={{
+                  fontSize: 11,
+                  fontWeight: 600,
+                  padding: "4px 10px",
+                  borderRadius: 6,
+                  color: C.red,
+                  background: C.redDim,
+                  border: `1px solid rgba(239,68,68,0.2)`,
+                }}
+              >
+                SQL Injection
+              </span>
+            </div>
+            <div
+              style={{
+                fontSize: 22,
+                fontWeight: 600,
+                color: C.text0,
+                letterSpacing: "-.02em",
+                marginBottom: 8,
+              }}
+            >
+              {ch.title}
+            </div>
+            <div
+              style={{
+                fontSize: 14,
+                color: C.text1,
+                lineHeight: 1.6,
+                maxWidth: 650,
+              }}
+            >
+              {ch.description}
+            </div>
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 16,
+              flexShrink: 0,
+            }}
+          >
+            <div style={{ textAlign: "right" }}>
+              <div
+                style={{
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: C.text2,
+                  marginBottom: 4,
+                  textTransform: "uppercase",
+                  letterSpacing: ".05em",
+                }}
+              >
+                Reward
+              </div>
+              <div
+                style={{
+                  fontSize: 28,
+                  fontWeight: 600,
+                  color: C.green,
+                  letterSpacing: "-.02em",
+                  lineHeight: 1,
+                }}
+              >
+                +{ch.points}
+              </div>
+            </div>
+            <div
+              style={{
+                width: 1,
+                height: 40,
+                background: C.border,
+                margin: "0 8px",
+              }}
+            />
+            <button
+              onClick={closeChallenge}
+              style={{
+                fontFamily: sans,
+                background: "transparent",
+                border: `1px solid ${C.border}`,
+                borderRadius: 6,
+                padding: "8px 14px",
+                color: C.text1,
+                cursor: "pointer",
+                fontSize: 13,
+                fontWeight: 500,
+                transition: "all 0.15s",
+              }}
+              onMouseOver={(e) => {
+                e.currentTarget.style.background = C.bg2;
+                e.currentTarget.style.color = C.text0;
+              }}
+              onMouseOut={(e) => {
+                e.currentTarget.style.background = "transparent";
+                e.currentTarget.style.color = C.text1;
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+
+        {/* Body */}
+        <div style={{ display: "flex", flex: 1, minHeight: 0, height: 600 }}>
+          {/* Editor area */}
+          <div
+            style={{
+              flex: 1,
+              minWidth: 0,
+              display: "flex",
+              flexDirection: "column",
+              background: C.bg0,
+            }}
+          >
+            {/* File tabs - Minimal Underline style */}
+            <div
+              style={{
+                display: "flex",
+                background: C.bg1,
+                borderBottom: `1px solid ${C.border}`,
+                padding: "0 16px",
+              }}
+            >
+              {(["route", "page", "diff"] as SqliFileTab[]).map((tab) => {
+                const labels: Record<SqliFileTab, string> = {
+                  route: "api/login/route.ts",
+                  page: "login/page.tsx",
+                  diff: "Diff View",
+                };
+                const statusMap: Record<SqliFileTab, boolean | null> = {
+                  route: sqliRouteOk ? true : sqliRouteFeedback ? false : null,
+                  page: sqliPageOk ? true : sqliPageFeedback ? false : null,
+                  diff: null,
+                };
+                const st = statusMap[tab];
+                const active = sqliActiveTab === tab;
+
+                return (
+                  <button
+                    key={tab}
+                    onClick={() => setSqliActiveTab(tab)}
+                    style={{
+                      fontFamily: sans,
+                      background: "transparent",
+                      border: "none",
+                      borderBottom: `2px solid ${active ? C.text0 : "transparent"}`,
+                      padding: "16px 16px",
+                      fontSize: 13,
+                      fontWeight: active ? 600 : 500,
+                      color: active ? C.text0 : C.text2,
+                      cursor: "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      transition: "all .15s",
+                      transform: "translateY(1px)",
+                    }}
+                  >
+                    {labels[tab]}
+                    {st === true && (
+                      <span style={{ fontSize: 12, color: C.green }}>✓</span>
+                    )}
+                    {st === false && (
+                      <span style={{ fontSize: 12, color: C.red }}>✕</span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Toolbar */}
+            {sqliActiveTab !== "diff" && (
+              <div
+                style={{
+                  padding: "12px 24px",
+                  borderBottom: `1px solid ${C.border}`,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  background: C.bg0,
+                }}
+              >
+                <button
+                  onClick={() => setSqliShowHint((h) => !h)}
+                  style={{
+                    fontFamily: sans,
+                    background: sqliShowHint ? C.bg2 : "transparent",
+                    border: `1px solid ${sqliShowHint ? C.border2 : C.border}`,
+                    borderRadius: 6,
+                    padding: "6px 12px",
+                    color: sqliShowHint ? C.text0 : C.text2,
+                    cursor: "pointer",
+                    fontSize: 12,
+                    fontWeight: 500,
+                  }}
+                >
+                  {sqliShowHint ? "Hide hint" : "Show hint"}
+                </button>
+              </div>
+            )}
+
+            {/* Hint panel */}
+            {sqliActiveTab !== "diff" &&
+              sqliShowHint &&
+              renderHints(activeHints)}
+
+            {/* Per-file feedback stripe */}
+            {(activeRouteFeedback || activePageFeedback) &&
+              (() => {
+                const ok = sqliActiveTab === "route" ? sqliRouteOk : sqliPageOk;
+                const fb =
+                  sqliActiveTab === "route"
+                    ? sqliRouteFeedback
+                    : sqliPageFeedback;
+                return (
+                  <div
+                    style={{
+                      padding: "12px 24px",
+                      fontSize: 13,
+                      fontWeight: 500,
+                      borderBottom: `1px solid ${ok ? C.greenBorder : "rgba(239,68,68,0.2)"}`,
+                      color: ok ? C.green : C.red,
+                      background: ok ? C.greenDim : C.redDim,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 10,
+                    }}
+                  >
+                    {fb}
+                  </div>
+                );
+              })()}
+
+            {/* Textareas */}
+            {sqliActiveTab === "route" && (
+              <textarea
+                value={sqliRouteCode}
+                onChange={(e) => {
+                  setSqliRouteCode(e.target.value);
+                  if (challengeResult !== "pass") {
+                    setChallengeResult("idle");
+                    setSqliRouteFeedback("");
+                    setSqliRouteOk(false);
+                  }
+                }}
+                spellCheck={false}
+                style={{
+                  flex: 1,
+                  background: "transparent",
+                  color: C.text0,
+                  fontFamily: mono,
+                  fontSize: 13.5,
+                  lineHeight: 1.6,
+                  padding: "20px 24px",
+                  border: "none",
+                  resize: "none",
+                  minHeight: 0,
+                  tabSize: 2,
+                }}
+              />
+            )}
+            {sqliActiveTab === "page" && (
+              <textarea
+                value={sqliPageCode}
+                onChange={(e) => {
+                  setSqliPageCode(e.target.value);
+                  if (challengeResult !== "pass") {
+                    setChallengeResult("idle");
+                    setSqliPageFeedback("");
+                    setSqliPageOk(false);
+                  }
+                }}
+                spellCheck={false}
+                style={{
+                  flex: 1,
+                  background: "transparent",
+                  color: C.text0,
+                  fontFamily: mono,
+                  fontSize: 13.5,
+                  lineHeight: 1.6,
+                  padding: "20px 24px",
+                  border: "none",
+                  resize: "none",
+                  minHeight: 0,
+                  tabSize: 2,
+                }}
+              />
+            )}
+            {sqliActiveTab === "diff" && renderSqliDiff(ch)}
+          </div>
+
+          {renderRightPane(ch, true)}
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Single-snippet modal ─────────────────────────────────────────────────
+  function renderSingleModal(ch: SingleSnippetChallenge) {
+    return (
+      <div
+        style={{
+          width: "100%",
+          maxWidth: 1100,
+          background: C.bg1,
+          border: `1px solid ${C.border2}`,
+          borderRadius: 20,
+          display: "flex",
+          flexDirection: "column",
+          maxHeight: "96vh",
+          overflow: "hidden",
+          boxShadow: "0 40px 80px rgba(0,0,0,0.7)",
+        }}
+      >
+        {/* Header */}
+        <div
+          style={{
+            padding: "22px 28px",
+            borderBottom: `1px solid ${C.border}`,
+            background: C.bg0,
+            flexShrink: 0,
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-start",
+            gap: 20,
+          }}
+        >
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                marginBottom: 12,
+                flexWrap: "wrap",
+              }}
+            >
+              <span
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  letterSpacing: ".12em",
+                  padding: "3px 10px",
+                  borderRadius: 5,
+                  color: C.green,
+                  background: C.greenDim,
+                  border: `1px solid ${C.greenBorder}`,
+                }}
+              >
+                HOTFIX CHALLENGE
+              </span>
+              {challengeType && (
+                <span
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    letterSpacing: ".12em",
+                    padding: "3px 10px",
+                    borderRadius: 5,
+                    color: TYPE_COLORS[challengeType].text,
+                    background: TYPE_COLORS[challengeType].bg,
+                    border: `1px solid ${TYPE_COLORS[challengeType].border}`,
+                  }}
+                >
+                  {TYPE_LABELS[challengeType]}
+                </span>
+              )}
+            </div>
+            <div
+              style={{
+                fontSize: 22,
+                fontWeight: 800,
+                color: C.text0,
+                letterSpacing: "-.03em",
+                marginBottom: 8,
+              }}
+            >
+              {ch.title}
+            </div>
+            <div
+              style={{
+                fontSize: 13,
+                color: C.text1,
+                lineHeight: 1.7,
+                maxWidth: 600,
+              }}
+            >
+              {ch.description}
+            </div>
+          </div>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 14,
+              flexShrink: 0,
+            }}
+          >
+            <div
+              style={{
+                background: C.greenDim,
+                border: `1px solid ${C.greenBorder}`,
+                borderRadius: 12,
+                padding: "12px 22px",
+                textAlign: "center",
+              }}
+            >
+              <div
+                style={{
+                  fontSize: 9,
+                  fontWeight: 700,
+                  letterSpacing: ".12em",
+                  color: C.green,
+                  marginBottom: 4,
+                }}
+              >
+                REWARD
+              </div>
+              <div
+                style={{
+                  fontSize: 30,
+                  fontWeight: 800,
+                  color: C.green,
+                  letterSpacing: "-.04em",
+                  lineHeight: 1,
+                }}
+              >
+                +{ch.points}
+              </div>
+            </div>
+            <button
+              onClick={closeChallenge}
+              style={{
+                fontFamily: sans,
+                background: "transparent",
+                border: `1px solid ${C.border2}`,
+                borderRadius: 8,
+                padding: "9px 16px",
+                color: C.text2,
+                cursor: "pointer",
+                fontSize: 12,
+                fontWeight: 700,
+              }}
+            >
+              ESC ✕
+            </button>
+          </div>
+        </div>
+
+        {/* Body */}
+        <div style={{ display: "flex", flex: 1, minHeight: 0, height: 560 }}>
+          <div
+            style={{
+              flex: 1,
+              minWidth: 0,
+              display: "flex",
+              flexDirection: "column",
+              background: C.bg0,
+            }}
+          >
+            {/* Toolbar */}
+            <div
+              style={{
+                padding: "10px 20px",
+                borderBottom: `1px solid ${C.border}`,
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                flexShrink: 0,
+              }}
+            >
+              <button
+                onClick={() => setShowHint((h) => !h)}
+                style={{
+                  fontFamily: sans,
+                  background: showHint ? C.amberDim : "transparent",
+                  border: `1px solid ${showHint ? "rgba(251,191,36,0.3)" : C.border2}`,
+                  borderRadius: 7,
+                  padding: "6px 14px",
+                  color: showHint ? C.amber : C.text2,
+                  cursor: "pointer",
+                  fontSize: 11,
+                  fontWeight: 700,
+                  letterSpacing: ".06em",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                }}
+              >
+                💡 {showHint ? "Hide hint" : "Show hint"}
+              </button>
+              <span
+                style={{
+                  marginLeft: "auto",
+                  fontSize: 10,
+                  color: C.text3,
+                  fontFamily: mono,
+                }}
+              >
+                hotfix.ts
+              </span>
+            </div>
+
+            {/* Hint panel */}
+            {showHint && renderHints(ch.hints)}
+
+            {/* Editor label */}
+            <div
+              style={{
+                padding: "10px 20px 0",
+                flexShrink: 0,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                <div
+                  style={{
+                    width: 7,
+                    height: 7,
+                    borderRadius: "50%",
+                    background: C.green,
+                  }}
+                />
+                <span
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    color: C.green,
+                    letterSpacing: ".1em",
+                  }}
+                >
+                  YOUR FIX
+                </span>
+              </div>
+              <span style={{ fontSize: 10, color: C.text3, fontFamily: mono }}>
+                hotfix.ts
+              </span>
+            </div>
+
+            <textarea
+              value={challengeCode}
+              onChange={(e) => {
+                setChallengeCode(e.target.value);
+                if (challengeResult !== "pass") {
+                  setChallengeResult("idle");
+                  setChallengeFeedback("");
+                }
+              }}
+              spellCheck={false}
+              style={{
+                flex: 1,
+                background: C.bg0,
+                color: "#c9c5bc",
+                fontFamily: mono,
+                fontSize: 13,
+                lineHeight: 1.8,
+                padding: "12px 20px 24px",
+                border: "none",
+                outline: "none",
+                resize: "none",
+                minHeight: 0,
+                tabSize: 2,
+              }}
+            />
+          </div>
+
+          {renderRightPane(ch, false)}
+        </div>
+      </div>
+    );
+  }
+
+  // ─── JSX ─────────────────────────────────────────────────────────────────
   return (
     <div
       style={{
@@ -740,631 +2294,28 @@ export default function DefensePage() {
         />
       )}
 
-      {/* ── CHALLENGE MODAL ───────────────────────────────────────── */}
+      {/* CHALLENGE MODAL */}
       {challengeOpen && challenge && (
         <div
           style={{
             position: "fixed",
             inset: 0,
-            background: "rgba(0,0,0,0.75)",
-            backdropFilter: "blur(6px)",
+            background: "rgba(0,0,0,0.78)",
+            backdropFilter: "blur(8px)",
             zIndex: 1000,
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            padding: 24,
+            padding: 20,
           }}
         >
-          <div
-            style={{
-              width: "100%",
-              maxWidth: 980,
-              background: "#16161a",
-              border: "1px solid #2a2a30",
-              borderRadius: 16,
-              display: "flex",
-              flexDirection: "column",
-              maxHeight: "94vh",
-              overflow: "hidden",
-              boxShadow: "0 32px 64px rgba(0,0,0,0.6)",
-            }}
-          >
-            {/* Modal header */}
-            <div
-              style={{
-                padding: "20px 28px",
-                borderBottom: "1px solid #1e1e24",
-                background: "#111115",
-                flexShrink: 0,
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "flex-start",
-              }}
-            >
-              <div>
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 10,
-                    marginBottom: 8,
-                  }}
-                >
-                  <span
-                    style={{
-                      fontSize: 10,
-                      fontWeight: 700,
-                      letterSpacing: "0.14em",
-                      color: "#4ade80",
-                      background: "rgba(74,222,128,0.1)",
-                      padding: "3px 9px",
-                      borderRadius: 4,
-                      border: "1px solid rgba(74,222,128,0.2)",
-                    }}
-                  >
-                    HOTFIX CHALLENGE
-                  </span>
-                  {challengeType && (
-                    <span
-                      style={{
-                        fontSize: 10,
-                        fontWeight: 700,
-                        letterSpacing: "0.1em",
-                        color: TYPE_COLORS[challengeType].text,
-                        background: TYPE_COLORS[challengeType].bg,
-                        padding: "3px 9px",
-                        borderRadius: 4,
-                        border: `1px solid ${TYPE_COLORS[challengeType].border}`,
-                      }}
-                    >
-                      {TYPE_LABELS[challengeType]}
-                    </span>
-                  )}
-                </div>
-                <div
-                  style={{
-                    fontSize: 20,
-                    fontWeight: 700,
-                    color: "#f0ece4",
-                    letterSpacing: "-0.02em",
-                    marginBottom: 6,
-                  }}
-                >
-                  {challenge.title}
-                </div>
-                <div
-                  style={{
-                    fontSize: 13,
-                    color: "#8b8480",
-                    lineHeight: 1.65,
-                    maxWidth: 560,
-                  }}
-                >
-                  {challenge.description}
-                </div>
-              </div>
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 16,
-                  flexShrink: 0,
-                  marginLeft: 24,
-                }}
-              >
-                <div
-                  style={{
-                    textAlign: "center",
-                    background: "rgba(74,222,128,0.08)",
-                    border: "1px solid rgba(74,222,128,0.2)",
-                    borderRadius: 10,
-                    padding: "10px 18px",
-                  }}
-                >
-                  <div
-                    style={{
-                      fontSize: 10,
-                      color: "#4ade80",
-                      fontWeight: 700,
-                      letterSpacing: "0.1em",
-                      marginBottom: 2,
-                    }}
-                  >
-                    REWARD
-                  </div>
-                  <div
-                    style={{
-                      fontSize: 26,
-                      fontWeight: 800,
-                      color: "#4ade80",
-                      letterSpacing: "-0.03em",
-                    }}
-                  >
-                    +{challenge.points}
-                  </div>
-                </div>
-                <button
-                  onClick={closeChallenge}
-                  style={{
-                    fontFamily: sans,
-                    background: "transparent",
-                    border: "1px solid #2a2a30",
-                    borderRadius: 8,
-                    padding: "8px 14px",
-                    color: "#78716c",
-                    cursor: "pointer",
-                    fontSize: 12,
-                    fontWeight: 600,
-                    letterSpacing: "0.04em",
-                  }}
-                >
-                  ESC ✕
-                </button>
-              </div>
-            </div>
-
-            {/* Modal body */}
-            <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
-              {/* Left — code editor area */}
-              <div
-                style={{
-                  flex: 1,
-                  display: "flex",
-                  flexDirection: "column",
-                  minWidth: 0,
-                  background: "#0d0d10",
-                }}
-              >
-                {/* Vuln toggle bar */}
-                <div
-                  style={{
-                    padding: "10px 20px",
-                    borderBottom: "1px solid #1e1e24",
-                    flexShrink: 0,
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 12,
-                  }}
-                >
-                  <button
-                    onClick={() => setShowVulnerable((v) => !v)}
-                    style={{
-                      fontFamily: sans,
-                      background: showVulnerable
-                        ? "rgba(239,68,68,0.12)"
-                        : "transparent",
-                      border: `1px solid ${showVulnerable ? "rgba(239,68,68,0.35)" : "#2a2a30"}`,
-                      borderRadius: 6,
-                      padding: "5px 12px",
-                      color: showVulnerable ? "#f87171" : "#6b6b70",
-                      cursor: "pointer",
-                      fontSize: 11,
-                      fontWeight: 700,
-                      letterSpacing: "0.06em",
-                      transition: "all 0.15s",
-                    }}
-                  >
-                    {showVulnerable ? "▲ HIDE VULN CODE" : "▼ SHOW VULN CODE"}
-                  </button>
-                  <button
-                    onClick={() => setShowHint((h) => !h)}
-                    style={{
-                      fontFamily: sans,
-                      background: showHint
-                        ? "rgba(251,191,36,0.1)"
-                        : "transparent",
-                      border: `1px solid ${showHint ? "rgba(251,191,36,0.3)" : "#2a2a30"}`,
-                      borderRadius: 6,
-                      padding: "5px 12px",
-                      color: showHint ? "#fbbf24" : "#6b6b70",
-                      cursor: "pointer",
-                      fontSize: 11,
-                      fontWeight: 700,
-                      letterSpacing: "0.06em",
-                      transition: "all 0.15s",
-                    }}
-                  >
-                    💡 {showHint ? "HIDE HINT" : "NEED A HINT?"}
-                  </button>
-                </div>
-
-                {/* Vulnerable code */}
-                {showVulnerable && (
-                  <div
-                    style={{
-                      padding: "14px 20px",
-                      background: "rgba(239,68,68,0.05)",
-                      borderBottom: "1px solid rgba(239,68,68,0.15)",
-                      flexShrink: 0,
-                    }}
-                  >
-                    <div
-                      style={{
-                        fontSize: 10,
-                        fontWeight: 700,
-                        color: "#f87171",
-                        letterSpacing: "0.1em",
-                        marginBottom: 8,
-                      }}
-                    >
-                      ❌ VULNERABLE CODE
-                    </div>
-                    <pre
-                      style={{
-                        margin: 0,
-                        fontSize: 12,
-                        color: "#fca5a5",
-                        lineHeight: 1.7,
-                        whiteSpace: "pre-wrap",
-                        wordBreak: "break-all",
-                        fontFamily: mono,
-                      }}
-                    >
-                      {challenge.vulnerableCode}
-                    </pre>
-                  </div>
-                )}
-
-                {/* Hint */}
-                {showHint && (
-                  <div
-                    style={{
-                      padding: "12px 20px",
-                      background: "rgba(251,191,36,0.05)",
-                      borderBottom: "1px solid rgba(251,191,36,0.15)",
-                      flexShrink: 0,
-                      fontSize: 13,
-                      color: "#fbbf24",
-                      lineHeight: 1.6,
-                    }}
-                  >
-                    💡 {challenge.hint}
-                  </div>
-                )}
-
-                {/* Editor label */}
-                <div
-                  style={{
-                    padding: "10px 20px 0",
-                    flexShrink: 0,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                  }}
-                >
-                  <div
-                    style={{ display: "flex", alignItems: "center", gap: 8 }}
-                  >
-                    <div
-                      style={{
-                        width: 8,
-                        height: 8,
-                        borderRadius: "50%",
-                        background: "#4ade80",
-                      }}
-                    />
-                    <span
-                      style={{
-                        fontSize: 10,
-                        fontWeight: 700,
-                        color: "#4ade80",
-                        letterSpacing: "0.1em",
-                      }}
-                    >
-                      YOUR FIX
-                    </span>
-                  </div>
-                  <span
-                    style={{ fontSize: 10, color: "#3a3a42", fontFamily: mono }}
-                  >
-                    hotfix.ts
-                  </span>
-                </div>
-
-                {/* Textarea */}
-                <textarea
-                  value={challengeCode}
-                  onChange={(e) => {
-                    setChallengeCode(e.target.value);
-                    if (challengeResult !== "pass") {
-                      setChallengeResult("idle");
-                      setChallengeFeedback("");
-                    }
-                  }}
-                  spellCheck={false}
-                  style={{
-                    flex: 1,
-                    background: "#0d0d10",
-                    color: "#d4d0c8",
-                    fontFamily: mono,
-                    fontSize: 13,
-                    lineHeight: 1.8,
-                    padding: "12px 20px 20px",
-                    border: "none",
-                    outline: "none",
-                    resize: "none",
-                    minHeight: 220,
-                    tabSize: 2,
-                  }}
-                />
-              </div>
-
-              {/* Right — validator panel */}
-              <div
-                style={{
-                  width: 300,
-                  flexShrink: 0,
-                  display: "flex",
-                  flexDirection: "column",
-                  borderLeft: "1px solid #1e1e24",
-                  background: "#111115",
-                }}
-              >
-                {/* Run button area */}
-                <div
-                  style={{
-                    padding: "20px",
-                    borderBottom: "1px solid #1e1e24",
-                    flexShrink: 0,
-                  }}
-                >
-                  <button
-                    onClick={submitChallenge}
-                    disabled={
-                      challengeResult === "running" ||
-                      challengeResult === "pass"
-                    }
-                    style={{
-                      fontFamily: sans,
-                      width: "100%",
-                      padding: "13px",
-                      borderRadius: 8,
-                      fontSize: 13,
-                      fontWeight: 700,
-                      letterSpacing: "0.04em",
-                      border: "none",
-                      cursor:
-                        challengeResult === "pass"
-                          ? "default"
-                          : challengeResult === "running"
-                            ? "wait"
-                            : "pointer",
-                      background:
-                        challengeResult === "pass"
-                          ? "rgba(74,222,128,0.12)"
-                          : challengeResult === "running"
-                            ? "#1e1e24"
-                            : "#4ade80",
-                      color:
-                        challengeResult === "pass"
-                          ? "#4ade80"
-                          : challengeResult === "running"
-                            ? "#3a3a42"
-                            : "#0a1a0a",
-                      transition: "all 0.15s",
-                    }}
-                  >
-                    {challengeResult === "running"
-                      ? "⟳  Validating…"
-                      : challengeResult === "pass"
-                        ? "✓  Fix Deployed!"
-                        : "▶  Run Validator"}
-                  </button>
-
-                  {challengeFeedback && (
-                    <div
-                      style={{
-                        marginTop: 12,
-                        padding: "11px 14px",
-                        borderRadius: 7,
-                        fontSize: 12,
-                        lineHeight: 1.65,
-                        ...(challengeResult === "pass"
-                          ? {
-                              background: "rgba(74,222,128,0.08)",
-                              border: "1px solid rgba(74,222,128,0.2)",
-                              color: "#4ade80",
-                            }
-                          : {
-                              background: "rgba(239,68,68,0.08)",
-                              border: "1px solid rgba(239,68,68,0.2)",
-                              color: "#f87171",
-                            }),
-                      }}
-                    >
-                      {challengeFeedback}
-                    </div>
-                  )}
-                </div>
-
-                {/* Effects */}
-                <div style={{ padding: "20px", overflowY: "auto", flex: 1 }}>
-                  <div
-                    style={{
-                      fontSize: 10,
-                      fontWeight: 700,
-                      letterSpacing: "0.1em",
-                      color: "#3a3a42",
-                      marginBottom: 14,
-                    }}
-                  >
-                    ON PASS — GLOBAL EFFECTS
-                  </div>
-                  <div
-                    style={{
-                      display: "flex",
-                      flexDirection: "column",
-                      gap: 10,
-                    }}
-                  >
-                    {[
-                      {
-                        icon: "⬛",
-                        text: `All ${challengeType ? TYPE_LABELS[challengeType] : ""} logs marked fixed`,
-                      },
-                      {
-                        icon: "◼",
-                        text: "New attacks of this type stop spawning",
-                      },
-                      challengeType === "sqli"
-                        ? {
-                            icon: "◼",
-                            text: "Login page shows patch banner live",
-                          }
-                        : null,
-                      challengeType === "jwt_forge"
-                        ? {
-                            icon: "◼",
-                            text: "Profile page blocks forge attempts live",
-                          }
-                        : null,
-                      {
-                        icon: "◆",
-                        text: `+${challenge.points} pts added to your score`,
-                      },
-                    ]
-                      .filter(Boolean)
-                      .map((item, i) => (
-                        <div
-                          key={i}
-                          style={{
-                            display: "flex",
-                            gap: 10,
-                            alignItems: "flex-start",
-                          }}
-                        >
-                          <span
-                            style={{
-                              fontSize: 8,
-                              color: "#3a3a42",
-                              marginTop: 4,
-                              flexShrink: 0,
-                            }}
-                          >
-                            {item!.icon}
-                          </span>
-                          <span
-                            style={{
-                              fontSize: 12,
-                              color: "#6b6b70",
-                              lineHeight: 1.6,
-                            }}
-                          >
-                            {item!.text}
-                          </span>
-                        </div>
-                      ))}
-                  </div>
-
-                  {challengeResult === "pass" && (
-                    <div
-                      style={{
-                        marginTop: 20,
-                        padding: "14px",
-                        background: "rgba(74,222,128,0.08)",
-                        border: "1px solid rgba(74,222,128,0.2)",
-                        borderRadius: 8,
-                      }}
-                    >
-                      <div
-                        style={{
-                          fontSize: 11,
-                          fontWeight: 700,
-                          color: "#4ade80",
-                          letterSpacing: "0.06em",
-                          marginBottom: 5,
-                        }}
-                      >
-                        ✓ VULNERABILITY CLOSED
-                      </div>
-                      <div
-                        style={{
-                          fontSize: 12,
-                          color: "#86efac",
-                          lineHeight: 1.6,
-                        }}
-                      >
-                        {challengeType ? TYPE_LABELS[challengeType] : ""}{" "}
-                        attacks halted.
-                        {challengeType === "sqli" &&
-                          " Login page is now patched."}
-                        {challengeType === "jwt_forge" &&
-                          " Profile page now blocks forges."}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Score table */}
-                  <div style={{ marginTop: 24 }}>
-                    <div
-                      style={{
-                        fontSize: 10,
-                        fontWeight: 700,
-                        letterSpacing: "0.1em",
-                        color: "#3a3a42",
-                        marginBottom: 12,
-                      }}
-                    >
-                      CHALLENGE BOARD
-                    </div>
-                    {Object.entries(CHALLENGES).map(([type, ch]) => {
-                      const done = patchedTypes.has(type as AttackType);
-                      const tc = TYPE_COLORS[type as AttackType];
-                      return (
-                        <div
-                          key={type}
-                          style={{
-                            display: "flex",
-                            justifyContent: "space-between",
-                            alignItems: "center",
-                            padding: "9px 0",
-                            borderBottom: "1px solid #1e1e24",
-                            opacity: done ? 0.5 : 1,
-                          }}
-                        >
-                          <div
-                            style={{
-                              display: "flex",
-                              alignItems: "center",
-                              gap: 8,
-                            }}
-                          >
-                            {done && (
-                              <span style={{ fontSize: 10, color: "#4ade80" }}>
-                                ✓
-                              </span>
-                            )}
-                            <span
-                              style={{
-                                fontSize: 11,
-                                fontWeight: 600,
-                                color: done ? "#4ade80" : tc.text,
-                              }}
-                            >
-                              {TYPE_LABELS[type as AttackType]}
-                            </span>
-                          </div>
-                          <span
-                            style={{
-                              fontSize: 12,
-                              fontWeight: 700,
-                              color: done ? "#4ade80" : "#4a4a52",
-                            }}
-                          >
-                            +{ch!.points}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
+          {challenge.kind === "two-file"
+            ? renderSqliModal(challenge as TwoFileSqliChallenge)
+            : renderSingleModal(challenge as SingleSnippetChallenge)}
         </div>
       )}
 
-      {/* ── TOP BAR ─────────────────────────────────────────────────── */}
+      {/* TOP BAR */}
       <header
         style={{
           display: "flex",
@@ -1403,7 +2354,7 @@ export default function DefensePage() {
                 fontSize: 13,
                 fontWeight: 800,
                 color: "#f0ece4",
-                letterSpacing: "-0.02em",
+                letterSpacing: "-.02em",
               }}
             >
               BREACH<span style={{ color: "#4ade80" }}>@</span>TRIX
@@ -1419,15 +2370,14 @@ export default function DefensePage() {
               // blue team console
             </span>
           </div>
-
           {critCount > 0 && (
             <div
               style={{
                 display: "flex",
                 alignItems: "center",
                 gap: 6,
-                background: "rgba(239,68,68,0.1)",
-                border: "1px solid rgba(239,68,68,0.25)",
+                background: "rgba(239,68,68,.1)",
+                border: "1px solid rgba(239,68,68,.25)",
                 borderRadius: 6,
                 padding: "3px 10px",
               }}
@@ -1446,14 +2396,13 @@ export default function DefensePage() {
                   fontSize: 10,
                   color: "#ef4444",
                   fontWeight: 700,
-                  letterSpacing: "0.08em",
+                  letterSpacing: ".08em",
                 }}
               >
                 {critCount} CRITICAL ACTIVE
               </span>
             </div>
           )}
-
           {[...patchedTypes].map((t) => (
             <div
               key={t}
@@ -1461,8 +2410,8 @@ export default function DefensePage() {
                 display: "flex",
                 alignItems: "center",
                 gap: 5,
-                background: "rgba(74,222,128,0.08)",
-                border: "1px solid rgba(74,222,128,0.2)",
+                background: "rgba(74,222,128,.08)",
+                border: "1px solid rgba(74,222,128,.2)",
                 borderRadius: 6,
                 padding: "3px 10px",
               }}
@@ -1472,7 +2421,7 @@ export default function DefensePage() {
                   fontSize: 10,
                   color: "#4ade80",
                   fontWeight: 700,
-                  letterSpacing: "0.06em",
+                  letterSpacing: ".06em",
                 }}
               >
                 ✓ {TYPE_LABELS[t].split(" ")[0]}
@@ -1480,7 +2429,6 @@ export default function DefensePage() {
             </div>
           ))}
         </div>
-
         <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
           <div style={{ textAlign: "right" }}>
             <div
@@ -1488,7 +2436,7 @@ export default function DefensePage() {
                 fontSize: 9,
                 color: "#3a3a42",
                 fontWeight: 700,
-                letterSpacing: "0.1em",
+                letterSpacing: ".1em",
                 marginBottom: 1,
               }}
             >
@@ -1500,7 +2448,7 @@ export default function DefensePage() {
                 fontWeight: 800,
                 color: "#4ade80",
                 lineHeight: 1,
-                letterSpacing: "-0.03em",
+                letterSpacing: "-.03em",
                 fontFamily: mono,
               }}
             >
@@ -1514,7 +2462,7 @@ export default function DefensePage() {
                 fontSize: 9,
                 color: "#3a3a42",
                 fontWeight: 700,
-                letterSpacing: "0.1em",
+                letterSpacing: ".1em",
                 marginBottom: 1,
               }}
             >
@@ -1540,22 +2488,13 @@ export default function DefensePage() {
                 fontFamily: sans,
                 fontSize: 11,
                 fontWeight: 700,
-                letterSpacing: "0.06em",
+                letterSpacing: ".06em",
                 padding: "6px 12px",
                 borderRadius: 6,
                 cursor: "pointer",
                 background: "transparent",
                 border: "1px solid #2a2a30",
                 color: "#4a4a52",
-                transition: "all 0.1s",
-              }}
-              onMouseOver={(e) => {
-                e.currentTarget.style.borderColor = "#3a3a42";
-                e.currentTarget.style.color = "#78716c";
-              }}
-              onMouseOut={(e) => {
-                e.currentTarget.style.borderColor = "#2a2a30";
-                e.currentTarget.style.color = "#4a4a52";
               }}
             >
               CLEAR
@@ -1566,20 +2505,19 @@ export default function DefensePage() {
                 fontFamily: sans,
                 fontSize: 11,
                 fontWeight: 700,
-                letterSpacing: "0.06em",
+                letterSpacing: ".06em",
                 padding: "6px 12px",
                 borderRadius: 6,
                 cursor: "pointer",
-                transition: "all 0.1s",
                 ...(isRunning
                   ? {
-                      background: "rgba(251,191,36,0.1)",
-                      border: "1px solid rgba(251,191,36,0.25)",
+                      background: "rgba(251,191,36,.1)",
+                      border: "1px solid rgba(251,191,36,.25)",
                       color: "#fbbf24",
                     }
                   : {
-                      background: "rgba(74,222,128,0.1)",
-                      border: "1px solid rgba(74,222,128,0.25)",
+                      background: "rgba(74,222,128,.1)",
+                      border: "1px solid rgba(74,222,128,.25)",
                       color: "#4ade80",
                     }),
               }}
@@ -1590,7 +2528,7 @@ export default function DefensePage() {
         </div>
       </header>
 
-      {/* ── MAIN LAYOUT ──────────────────────────────────────────────── */}
+      {/* MAIN LAYOUT */}
       <div
         style={{
           display: "flex",
@@ -1599,7 +2537,7 @@ export default function DefensePage() {
           height: "calc(100vh - 58px)",
         }}
       >
-        {/* ── LEFT: LOG LIST ── */}
+        {/* LEFT: LOG LIST */}
         <div
           style={{
             flex: 1,
@@ -1609,7 +2547,7 @@ export default function DefensePage() {
             minWidth: 0,
           }}
         >
-          {/* Filter tabs + count */}
+          {/* Filter tabs */}
           <div
             style={{
               display: "flex",
@@ -1641,10 +2579,10 @@ export default function DefensePage() {
                       padding: "14px 18px",
                       fontSize: 11,
                       fontWeight: 700,
-                      letterSpacing: "0.08em",
+                      letterSpacing: ".08em",
                       color: active ? "#4ade80" : "#4a4a52",
                       cursor: "pointer",
-                      transition: "all 0.15s",
+                      transition: "all .15s",
                       display: "flex",
                       alignItems: "center",
                       gap: 7,
@@ -1657,9 +2595,7 @@ export default function DefensePage() {
                         fontWeight: 700,
                         padding: "1px 6px",
                         borderRadius: 10,
-                        background: active
-                          ? "rgba(74,222,128,0.15)"
-                          : "#1e1e24",
+                        background: active ? "rgba(74,222,128,.15)" : "#1e1e24",
                         color: active ? "#4ade80" : "#3a3a42",
                       }}
                     >
@@ -1673,7 +2609,7 @@ export default function DefensePage() {
               style={{
                 fontSize: 10,
                 fontWeight: 700,
-                letterSpacing: "0.08em",
+                letterSpacing: ".08em",
                 color: isRunning ? "#4ade80" : "#4a4a52",
                 display: "flex",
                 alignItems: "center",
@@ -1706,7 +2642,7 @@ export default function DefensePage() {
               borderBottom: "1px solid #1e1e24",
               fontSize: 10,
               fontWeight: 700,
-              letterSpacing: "0.1em",
+              letterSpacing: ".1em",
               color: "#3a3a42",
               flexShrink: 0,
             }}
@@ -1737,7 +2673,7 @@ export default function DefensePage() {
                     fontSize: 12,
                     color: "#3a3a42",
                     fontWeight: 600,
-                    letterSpacing: "0.06em",
+                    letterSpacing: ".06em",
                   }}
                 >
                   {filterTab === "acknowledged"
@@ -1767,7 +2703,7 @@ export default function DefensePage() {
                     background: isSel ? "#141418" : "transparent",
                     cursor: "pointer",
                     opacity: isGP ? 0.35 : 1,
-                    transition: "background 0.1s",
+                    transition: "background .1s",
                   }}
                   onMouseOver={(e) => {
                     if (!isSel) e.currentTarget.style.background = "#111115";
@@ -1798,7 +2734,7 @@ export default function DefensePage() {
                       style={{
                         fontSize: 10,
                         fontWeight: 700,
-                        letterSpacing: "0.06em",
+                        letterSpacing: ".06em",
                         color: sev.color,
                       }}
                     >
@@ -1810,7 +2746,7 @@ export default function DefensePage() {
                       style={{
                         fontSize: 10,
                         fontWeight: 700,
-                        letterSpacing: "0.06em",
+                        letterSpacing: ".06em",
                         padding: "2px 7px",
                         borderRadius: 4,
                         color: tc.text,
@@ -1857,9 +2793,9 @@ export default function DefensePage() {
                           padding: "2px 7px",
                           borderRadius: 4,
                           color: "#4ade80",
-                          background: "rgba(74,222,128,0.1)",
-                          border: "1px solid rgba(74,222,128,0.2)",
-                          letterSpacing: "0.06em",
+                          background: "rgba(74,222,128,.1)",
+                          border: "1px solid rgba(74,222,128,.2)",
+                          letterSpacing: ".06em",
                         }}
                       >
                         FIXED
@@ -1873,9 +2809,9 @@ export default function DefensePage() {
                           padding: "2px 7px",
                           borderRadius: 4,
                           color: "#38bdf8",
-                          background: "rgba(56,189,248,0.08)",
-                          border: "1px solid rgba(56,189,248,0.2)",
-                          letterSpacing: "0.06em",
+                          background: "rgba(56,189,248,.08)",
+                          border: "1px solid rgba(56,189,248,.2)",
+                          letterSpacing: ".06em",
                         }}
                       >
                         ACK
@@ -1888,7 +2824,7 @@ export default function DefensePage() {
           </div>
         </div>
 
-        {/* ── RIGHT: INSPECTOR ── */}
+        {/* RIGHT: INSPECTOR */}
         <div
           style={{
             width: 420,
@@ -1899,7 +2835,6 @@ export default function DefensePage() {
             borderLeft: "1px solid #1e1e24",
           }}
         >
-          {/* Inspector header */}
           <div
             style={{
               padding: "14px 22px",
@@ -1914,7 +2849,7 @@ export default function DefensePage() {
               style={{
                 fontSize: 10,
                 fontWeight: 700,
-                letterSpacing: "0.12em",
+                letterSpacing: ".12em",
                 color: "#3a3a42",
               }}
             >
@@ -1929,7 +2864,6 @@ export default function DefensePage() {
             )}
           </div>
 
-          {/* Inspector body */}
           <div
             style={{
               flex: 1,
@@ -1978,7 +2912,7 @@ export default function DefensePage() {
                   style={{
                     fontSize: 11,
                     fontWeight: 700,
-                    letterSpacing: "0.1em",
+                    letterSpacing: ".1em",
                     color: "#2a2a30",
                   }}
                 >
@@ -1995,7 +2929,6 @@ export default function DefensePage() {
                 const isGP = patchedTypes.has(selectedLog.type);
                 const canAck = !selectedLog.detected && !isGP;
                 const canPatch = selectedLog.detected && !isGP;
-
                 return (
                   <div
                     style={{
@@ -2014,7 +2947,6 @@ export default function DefensePage() {
                         overflow: "hidden",
                       }}
                     >
-                      {/* Card top accent */}
                       <div
                         style={{
                           height: 3,
@@ -2034,7 +2966,7 @@ export default function DefensePage() {
                             style={{
                               fontSize: 10,
                               fontWeight: 700,
-                              letterSpacing: "0.08em",
+                              letterSpacing: ".08em",
                               padding: "2px 8px",
                               borderRadius: 4,
                               color: tc.text,
@@ -2064,7 +2996,7 @@ export default function DefensePage() {
                                 fontSize: 10,
                                 fontWeight: 700,
                                 color: sev.color,
-                                letterSpacing: "0.06em",
+                                letterSpacing: ".06em",
                               }}
                             >
                               {sev.label}
@@ -2077,7 +3009,7 @@ export default function DefensePage() {
                             fontWeight: 800,
                             color: sev.color,
                             marginBottom: 6,
-                            letterSpacing: "-0.01em",
+                            letterSpacing: "-.01em",
                           }}
                         >
                           {selectedLog.user}
@@ -2092,8 +3024,6 @@ export default function DefensePage() {
                         >
                           {selectedLog.detail}
                         </div>
-
-                        {/* Meta grid */}
                         <div
                           style={{
                             display: "grid",
@@ -2119,7 +3049,7 @@ export default function DefensePage() {
                                   fontSize: 9,
                                   color: "#3a3a42",
                                   fontWeight: 700,
-                                  letterSpacing: "0.08em",
+                                  letterSpacing: ".08em",
                                   marginBottom: 3,
                                 }}
                               >
@@ -2138,13 +3068,12 @@ export default function DefensePage() {
                             </div>
                           ))}
                         </div>
-
                         <div
                           style={{
                             fontSize: 9,
                             color: "#3a3a42",
                             fontWeight: 700,
-                            letterSpacing: "0.08em",
+                            letterSpacing: ".08em",
                             marginBottom: 5,
                           }}
                         >
@@ -2176,8 +3105,8 @@ export default function DefensePage() {
                       <div
                         style={{
                           padding: "14px 16px",
-                          background: "rgba(74,222,128,0.06)",
-                          border: "1px solid rgba(74,222,128,0.18)",
+                          background: "rgba(74,222,128,.06)",
+                          border: "1px solid rgba(74,222,128,.18)",
                           borderRadius: 8,
                           display: "flex",
                           alignItems: "center",
@@ -2188,7 +3117,7 @@ export default function DefensePage() {
                           style={{
                             width: 20,
                             height: 20,
-                            background: "rgba(74,222,128,0.15)",
+                            background: "rgba(74,222,128,.15)",
                             borderRadius: "50%",
                             display: "flex",
                             alignItems: "center",
@@ -2246,9 +3175,9 @@ export default function DefensePage() {
                                 height: 20,
                                 borderRadius: "50%",
                                 background: selectedLog.detected
-                                  ? "rgba(74,222,128,0.15)"
-                                  : "rgba(56,189,248,0.15)",
-                                border: `1px solid ${selectedLog.detected ? "rgba(74,222,128,0.3)" : "rgba(56,189,248,0.3)"}`,
+                                  ? "rgba(74,222,128,.15)"
+                                  : "rgba(56,189,248,.15)",
+                                border: `1px solid ${selectedLog.detected ? "rgba(74,222,128,.3)" : "rgba(56,189,248,.3)"}`,
                                 display: "flex",
                                 alignItems: "center",
                                 justifyContent: "center",
@@ -2268,7 +3197,7 @@ export default function DefensePage() {
                                 color: selectedLog.detected
                                   ? "#4ade80"
                                   : "#38bdf8",
-                                letterSpacing: "0.06em",
+                                letterSpacing: ".06em",
                               }}
                             >
                               ACKNOWLEDGE
@@ -2279,7 +3208,7 @@ export default function DefensePage() {
                               flex: 1,
                               height: 1,
                               background: selectedLog.detected
-                                ? "rgba(74,222,128,0.2)"
+                                ? "rgba(74,222,128,.2)"
                                 : "#1e1e24",
                               margin: "0 10px",
                             }}
@@ -2297,9 +3226,9 @@ export default function DefensePage() {
                                 height: 20,
                                 borderRadius: "50%",
                                 background: canPatch
-                                  ? "rgba(74,222,128,0.15)"
+                                  ? "rgba(74,222,128,.15)"
                                   : "#1e1e24",
-                                border: `1px solid ${canPatch ? "rgba(74,222,128,0.3)" : "#2a2a30"}`,
+                                border: `1px solid ${canPatch ? "rgba(74,222,128,.3)" : "#2a2a30"}`,
                                 display: "flex",
                                 alignItems: "center",
                                 justifyContent: "center",
@@ -2315,15 +3244,13 @@ export default function DefensePage() {
                                 fontSize: 10,
                                 fontWeight: 700,
                                 color: canPatch ? "#4ade80" : "#3a3a42",
-                                letterSpacing: "0.06em",
+                                letterSpacing: ".06em",
                               }}
                             >
                               DEPLOY HOTFIX
                             </span>
                           </div>
                         </div>
-
-                        {/* Acknowledge button */}
                         <button
                           onClick={() => acknowledge(selectedLog.id)}
                           disabled={!canAck}
@@ -2334,22 +3261,22 @@ export default function DefensePage() {
                             borderRadius: 8,
                             fontSize: 12,
                             fontWeight: 700,
-                            letterSpacing: "0.04em",
+                            letterSpacing: ".04em",
                             cursor: canAck ? "pointer" : "not-allowed",
                             border: "1px solid",
-                            transition: "all 0.15s",
+                            transition: "all .15s",
                             display: "flex",
                             alignItems: "center",
                             justifyContent: "space-between",
                             ...(selectedLog.detected
                               ? {
-                                  background: "rgba(74,222,128,0.05)",
-                                  borderColor: "rgba(74,222,128,0.15)",
+                                  background: "rgba(74,222,128,.05)",
+                                  borderColor: "rgba(74,222,128,.15)",
                                   color: "#4a6a52",
                                 }
                               : {
-                                  background: "rgba(56,189,248,0.08)",
-                                  borderColor: "rgba(56,189,248,0.25)",
+                                  background: "rgba(56,189,248,.08)",
+                                  borderColor: "rgba(56,189,248,.25)",
                                   color: "#38bdf8",
                                 }),
                           }}
@@ -2391,7 +3318,7 @@ export default function DefensePage() {
                               style={{
                                 fontSize: 10,
                                 color: "#1a6080",
-                                background: "rgba(56,189,248,0.08)",
+                                background: "rgba(56,189,248,.08)",
                                 padding: "2px 7px",
                                 borderRadius: 4,
                               }}
@@ -2400,8 +3327,6 @@ export default function DefensePage() {
                             </span>
                           )}
                         </button>
-
-                        {/* Deploy Hotfix button */}
                         <button
                           onClick={() => openPatch(selectedLog.id)}
                           disabled={!canPatch}
@@ -2412,17 +3337,17 @@ export default function DefensePage() {
                             borderRadius: 8,
                             fontSize: 12,
                             fontWeight: 700,
-                            letterSpacing: "0.04em",
+                            letterSpacing: ".04em",
                             cursor: canPatch ? "pointer" : "not-allowed",
                             border: "1px solid",
-                            transition: "all 0.15s",
+                            transition: "all .15s",
                             display: "flex",
                             alignItems: "center",
                             justifyContent: "space-between",
                             ...(canPatch
                               ? {
-                                  background: "rgba(74,222,128,0.1)",
-                                  borderColor: "rgba(74,222,128,0.3)",
+                                  background: "rgba(74,222,128,.1)",
+                                  borderColor: "rgba(74,222,128,.3)",
                                   color: "#4ade80",
                                 }
                               : {
@@ -2443,9 +3368,7 @@ export default function DefensePage() {
                               {canPatch ? "⚡" : "⟳"}
                             </span>
                             <div style={{ textAlign: "left" }}>
-                              <div>
-                                {canPatch ? "Deploy Hotfix" : "Deploy Hotfix"}
-                              </div>
+                              <div>Deploy Hotfix</div>
                               <div
                                 style={{
                                   fontSize: 10,
@@ -2480,7 +3403,6 @@ export default function DefensePage() {
                       </div>
                     )}
 
-                    {/* Toast */}
                     {toast && (
                       <div
                         style={{
@@ -2488,16 +3410,16 @@ export default function DefensePage() {
                           borderRadius: 7,
                           fontSize: 12,
                           fontWeight: 600,
-                          animation: "fadeup 0.2s ease",
+                          animation: "fadeup .2s ease",
                           ...(toast.ok
                             ? {
-                                background: "rgba(74,222,128,0.08)",
-                                border: "1px solid rgba(74,222,128,0.2)",
+                                background: "rgba(74,222,128,.08)",
+                                border: "1px solid rgba(74,222,128,.2)",
                                 color: "#4ade80",
                               }
                             : {
-                                background: "rgba(239,68,68,0.08)",
-                                border: "1px solid rgba(239,68,68,0.2)",
+                                background: "rgba(239,68,68,.08)",
+                                border: "1px solid rgba(239,68,68,.2)",
                                 color: "#f87171",
                               }),
                         }}
@@ -2506,14 +3428,13 @@ export default function DefensePage() {
                       </div>
                     )}
 
-                    {/* User agent */}
                     <div>
                       <div
                         style={{
                           fontSize: 9,
                           color: "#2a2a30",
                           fontWeight: 700,
-                          letterSpacing: "0.1em",
+                          letterSpacing: ".1em",
                           marginBottom: 5,
                         }}
                       >
@@ -2537,7 +3458,7 @@ export default function DefensePage() {
             )}
           </div>
 
-          {/* Score ledger at bottom */}
+          {/* Score ledger */}
           <div style={{ borderTop: "1px solid #1e1e24", flexShrink: 0 }}>
             <div
               style={{
@@ -2552,7 +3473,7 @@ export default function DefensePage() {
                 style={{
                   fontSize: 10,
                   fontWeight: 700,
-                  letterSpacing: "0.1em",
+                  letterSpacing: ".1em",
                   color: "#3a3a42",
                 }}
               >
@@ -2594,7 +3515,7 @@ export default function DefensePage() {
                             fontSize: 10,
                             fontWeight: 700,
                             color: tc.text,
-                            letterSpacing: "0.06em",
+                            letterSpacing: ".06em",
                             marginBottom: 2,
                           }}
                         >
@@ -2628,7 +3549,7 @@ export default function DefensePage() {
                           fontWeight: 800,
                           color: "#4ade80",
                           marginLeft: 12,
-                          letterSpacing: "-0.02em",
+                          letterSpacing: "-.02em",
                           fontFamily: mono,
                         }}
                       >
@@ -2644,61 +3565,44 @@ export default function DefensePage() {
       </div>
 
       <style jsx global>{`
-        @import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap");
+        @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap");
+
         * {
           box-sizing: border-box;
         }
+
         body {
           margin: 0;
-          background: #0f0f11;
+          background: #09090b;
+          font-family: "Inter", system-ui, sans-serif;
+          -webkit-font-smoothing: antialiased;
         }
-        @keyframes pulse {
-          0%,
-          100% {
-            opacity: 1;
-            transform: scale(1);
-          }
-          50% {
-            opacity: 0.5;
-            transform: scale(0.8);
-          }
-        }
-        @keyframes redflash {
-          0% {
-            opacity: 1;
-          }
-          100% {
-            opacity: 0;
-          }
-        }
-        @keyframes fadeup {
-          from {
-            opacity: 0;
-            transform: translateY(4px);
-          }
-          to {
-            opacity: 1;
-            transform: translateY(0);
-          }
-        }
+
+        /* Minimal Scrollbar */
         ::-webkit-scrollbar {
-          width: 4px;
+          width: 6px;
+          height: 6px;
         }
         ::-webkit-scrollbar-track {
           background: transparent;
         }
         ::-webkit-scrollbar-thumb {
-          background: #2a2a30;
+          background: #3f3f46;
           border-radius: 4px;
         }
         ::-webkit-scrollbar-thumb:hover {
-          background: #3a3a42;
+          background: #52525b;
         }
-        textarea:focus {
-          outline: none;
-        }
+
+        textarea:focus,
         button:focus {
           outline: none;
+        }
+        textarea {
+          caret-color: #3b82f6;
+        }
+        textarea::selection {
+          background: rgba(59, 130, 246, 0.2);
         }
       `}</style>
     </div>
