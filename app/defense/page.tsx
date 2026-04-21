@@ -3,14 +3,15 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 
 const PATCH_KEYS: Partial<Record<AttackType, string>> = {
-  sqli: "patched_sqli",
+  sqli_login: "patched_sqli",
+  sqli_search: "patched_sqli_search",
   jwt_forge: "patched_jwt",
   xss: "patched_xss",
   idor: "patched_idor",
 };
 
 type Severity = "critical" | "high" | "medium" | "low";
-type AttackType = "jwt_forge" | "sqli" | "idor" | "xss";
+type AttackType = "jwt_forge" | "sqli_login" | "sqli_search" | "idor" | "xss";
 type FilterTab = "all" | "acknowledged" | "fixed";
 
 type LogEntry = {
@@ -40,10 +41,12 @@ type ScoreEntry = {
 };
 
 type ChallengeResult = "idle" | "running" | "pass" | "fail";
-type SqliFileTab = "route" | "page" | "diff";
+type SqliLoginFileTab = "route" | "page" | "diff";
+type SqliSearchFileTab = "route" | "page" | "diff";
+type JwtFileTab = "auth" | "route" | "diff";
 
-type TwoFileSqliChallenge = {
-  kind: "two-file";
+type TwoFileSqliLoginChallenge = {
+  kind: "two-file-sqli-login";
   title: string;
   description: string;
   points: number;
@@ -57,6 +60,36 @@ type TwoFileSqliChallenge = {
   validatePage: (code: string) => { pass: boolean; feedback: string };
 };
 
+type TwoFileSqliSearchChallenge = {
+  kind: "two-file-sqli-search";
+  title: string;
+  description: string;
+  points: number;
+  routeStarterCode: string;
+  pageStarterCode: string;
+  routeVulnCode: string;
+  pageVulnCode: string;
+  routeHints: string[];
+  pageHints: string[];
+  validateRoute: (code: string) => { pass: boolean; feedback: string };
+  validatePage: (code: string) => { pass: boolean; feedback: string };
+};
+
+type TwoFileJwtChallenge = {
+  kind: "two-file-jwt";
+  title: string;
+  description: string;
+  points: number;
+  authStarterCode: string;
+  routeStarterCode: string;
+  authVulnCode: string;
+  routeVulnCode: string;
+  authHints: string[];
+  routeHints: string[];
+  validateAuth: (code: string) => { pass: boolean; feedback: string };
+  validateRoute: (code: string) => { pass: boolean; feedback: string };
+};
+
 type SingleSnippetChallenge = {
   kind: "single";
   title: string;
@@ -68,10 +101,14 @@ type SingleSnippetChallenge = {
   hints: string[];
 };
 
-type Challenge = TwoFileSqliChallenge | SingleSnippetChallenge;
+type Challenge =
+  | TwoFileSqliLoginChallenge
+  | TwoFileSqliSearchChallenge
+  | TwoFileJwtChallenge
+  | SingleSnippetChallenge;
 
 // ─── Full file content ───────────────────────────────────────────────────────
-const SQLI_ROUTE_STARTER = `import { NextRequest, NextResponse } from "next/server";
+const SQLI_LOGIN_ROUTE_STARTER = `import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "../../../lib/db";
 import { signToken } from "../../../lib/auth";
 import { logAttack, detectSqli } from "../../../lib/logAttack";
@@ -162,7 +199,7 @@ export async function POST(req: NextRequest) {
   }
 }`;
 
-const SQLI_PAGE_STARTER = `"use client";
+const SQLI_LOGIN_PAGE_STARTER = `"use client";
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -294,16 +331,343 @@ export default function LoginPage() {
   );
 }`;
 
+// ─── Search SQLi file starters ────────────────────────────────────────────────
+const SQLI_SEARCH_ROUTE_STARTER = `import { NextRequest, NextResponse } from "next/server";
+import { getDb } from "../../../lib/db";
+import { logAttack, detectSqli } from "../../../lib/logAttack";
+import fs from "fs";
+import path from "path";
+
+function isSqliSearchPatched(): boolean {
+  if (process.env.PATCHED_SQLI_SEARCH === "1") return true;
+  try {
+    const flagFile = path.join(process.cwd(), ".patch-flags", "sqli_search");
+    return fs.existsSync(flagFile);
+  } catch { return false; }
+}
+
+export async function GET(req: NextRequest) {
+  const { searchParams } = new URL(req.url);
+  const query = searchParams.get("query") || "";
+  const ip =
+    req.headers.get("x-forwarded-for") ??
+    req.headers.get("x-real-ip") ??
+    "unknown";
+
+  const patched = isSqliSearchPatched();
+
+  if (detectSqli(query)) {
+    if (patched) {
+      logAttack({
+        type: "sqli",
+        severity: "high",
+        ip, userId: null, username: null,
+        detail: \`[BLOCKED] SQL injection attempt in /api/search — parameterized queries active: "\${query}"\`,
+        raw: { query, blocked: true },
+      });
+      return NextResponse.json(
+        { success: false, message: "Invalid search query." },
+        { status: 400 }
+      );
+    }
+    logAttack({
+      type: "sqli",
+      severity: "high",
+      ip, userId: null, username: null,
+      detail: \`SQL injection attempt in /api/search query param: "\${query}"\`,
+      raw: { query },
+    });
+  }
+
+  try {
+    const db = await getDb();
+    let rows: any[];
+
+    if (patched) {
+      // ✅ ALREADY PATCHED — this branch is safe
+      const [result]: any = await db.query(
+        "SELECT id, username, email, role, balance, account_number FROM users WHERE username LIKE ?",
+        [\`%\${query}%\`]
+      );
+      rows = result;
+    } else {
+      // 🔴 FIX THIS: raw string interpolation is exploitable
+      // Payload: ' UNION SELECT id,username,password,email,balance,account_number FROM users--
+      const sql = \`SELECT id, username, email, role, balance, account_number
+        FROM users WHERE username LIKE '%\${query}%'\`;
+      const [result]: any = await db.query(sql);
+      rows = result;
+
+      if (detectSqli(query) && rows && rows.length > 0) {
+        logAttack({
+          type: "sqli",
+          severity: "critical",
+          ip, userId: null, username: null,
+          detail: \`SQL injection on /api/search returned \${rows.length} row(s) — possible data exfiltration\`,
+          raw: { query, sql, row_count: rows.length, sample: rows.slice(0, 2) },
+        });
+      }
+    }
+
+    return NextResponse.json({
+      success: true,
+      results: rows,
+      meta: { count: rows.length, search: query, patched },
+    });
+
+  } catch (err: any) {
+    // 🔴 FIX THIS: never expose stack traces in production
+    return NextResponse.json(
+      { success: false, message: err.message, stack: err.stack, hint: "Query execution failed" },
+      { status: 500 }
+    );
+  }
+}`;
+
+const SQLI_SEARCH_PAGE_STARTER = `"use client";
+import { useState, useEffect } from "react";
+import Sidebar from "../../components/Sidebar";
+import { useTheme } from "../../components/ThemeProvider";
+
+const PATCH_KEY = "patched_sqli_search";
+
+export default function SearchPage() {
+  const { isDark } = useTheme();
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [searched, setSearched] = useState(false);
+  const [sqliFixed, setSqliFixed] = useState(false);
+  const [attackBlocked, setAttackBlocked] = useState(false);
+  const [lastAttack, setLastAttack] = useState<string | null>(null);
+
+  useEffect(() => {
+    function check() { setSqliFixed(localStorage.getItem(PATCH_KEY) === "1"); }
+    check();
+    const iv = setInterval(check, 800);
+    return () => clearInterval(iv);
+  }, []);
+
+  function detectSqliPattern(val: string): boolean {
+    return (
+      /'\s*(or|and)\s*'?\d/i.test(val) ||
+      /--[\s]/.test(val) || /--$/.test(val.trim()) || /#/.test(val) ||
+      /union\s+select/i.test(val) ||
+      /;\s*(drop|alter|insert)/i.test(val) ||
+      /'\s*or\s*'1'\s*=\s*'1/i.test(val) ||
+      /'\s*--\s*/.test(val) ||
+      /'\s*or\s+1\s*=\s*1/i.test(val)
+    );
+  }
+
+  function pushRealAttack(q: string, succeeded: boolean) {
+    const entry = {
+      id: Math.random().toString(36).slice(2, 10).toUpperCase(),
+      ts: Date.now(),
+      type: "sqli_search",
+      severity: "critical",
+      ip: "REAL ATTACKER",
+      port: 443,
+      user: "anon",
+      detail: succeeded
+        ? \`✦ REAL ATTACK — SQLi SUCCEEDED in search: dumped results via "\${q}"\`
+        : \`✦ REAL ATTACK — SQLi attempt blocked in search form: "\${q}"\`,
+      endpoint: "/api/search",
+      method: "GET",
+      statusCode: succeeded ? 200 : 403,
+      userAgent: navigator.userAgent.slice(0, 60),
+      payload: \`query=\${q}\`,
+      country: "LIVE",
+      patched: !succeeded,
+      blocked: false, detected: false, restored: false,
+    };
+    try {
+      const existing = JSON.parse(localStorage.getItem("real_attack_log") || "[]");
+      existing.unshift(entry);
+      localStorage.setItem("real_attack_log", JSON.stringify(existing.slice(0, 50)));
+    } catch { /* ignore */ }
+  }
+
+  const runSearch = async () => {
+    if (!query.trim()) return;
+    const isInjection = detectSqliPattern(query);
+
+    // 🔴 FIX THIS: when sqliFixed is true and injection is detected,
+    // block the request client-side before it reaches the server.
+    // Set attackBlocked=true, store lastAttack, call pushRealAttack(query, false), return early.
+
+    setAttackBlocked(false);
+    setLastAttack(null);
+    if (isInjection) pushRealAttack(query, false);
+
+    setLoading(true);
+    setSearched(true);
+    try {
+      const res = await fetch(\`/api/search?query=\${encodeURIComponent(query)}\`);
+      const data = await res.json();
+      if (data.success) {
+        setResults(data.results || []);
+        if (isInjection && (data.results?.length ?? 0) > 0) pushRealAttack(query, true);
+      } else { setResults([]); }
+    } catch { setResults([]); }
+    setLoading(false);
+  };
+
+  return (
+    <div>
+      {sqliFixed && (
+        <div style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 12, padding: 16, marginBottom: 24 }}>
+          SQL Injection — Patched: parameterized queries active on /api/search
+        </div>
+      )}
+      {attackBlocked && (
+        <div style={{ background: "#fff7ed", border: "1px solid #fed7aa", borderRadius: 12, padding: 16, marginBottom: 24 }}>
+          Attack Blocked — payload <code>{lastAttack}</code> intercepted by parameterized queries.
+        </div>
+      )}
+      <input
+        value={query}
+        onChange={e => { setQuery(e.target.value); setAttackBlocked(false); setLastAttack(null); }}
+        onKeyDown={e => e.key === "Enter" && runSearch()}
+        placeholder="Enter username or account ID..."
+      />
+      <button onClick={runSearch} disabled={loading}>{loading ? "..." : "Search"}</button>
+      {searched && !attackBlocked && (
+        <div>
+          {results.length === 0 ? (
+            // 🔴 XSS also present here — dangerouslySetInnerHTML in no-results message
+            <div dangerouslySetInnerHTML={{ __html: \`No users found matching "\${query}"\` }} />
+          ) : (
+            results.map((u, i) => (
+              <div key={i}>
+                {/* 🔴 Stored XSS — username rendered via dangerouslySetInnerHTML */}
+                <div dangerouslySetInnerHTML={{ __html: u.username || u[1] }} />
+                <div>{u.email || u[2]}</div>
+                <div style={{ fontSize: 10, fontFamily: "monospace" }}>
+                  RAW: {JSON.stringify(u)}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}`;
+
+// ─── JWT challenge file starters ─────────────────────────────────────────────
+const JWT_AUTH_STARTER = `import jwt from 'jsonwebtoken';
+
+// ✅ YOUR FIX — enforce algorithm, remove weak fallback secret
+// The current code accepts ANY algorithm (including "none") and falls back
+// to the hardcoded string "secret" when JWT_SECRET is not set.
+
+export function getUserFromToken(token: string) {
+  // 🔴 FIX: replace the line below with a secure jwt.verify() call
+  return jwt.verify(token, process.env.JWT_SECRET || 'secret');
+}
+
+export function signToken(payload: object) {
+  return jwt.sign(payload, process.env.JWT_SECRET || 'secret', {
+    expiresIn: '7d',
+  });
+}`;
+
+const JWT_ROUTE_STARTER = `import { NextRequest, NextResponse } from "next/server";
+import { getDb } from "../../../lib/db";
+import { getUserFromToken } from "../../../lib/auth";
+import { logAttack, detectJwtForgery, detectSqli } from "../../../lib/logAttack";
+
+export async function GET(req: NextRequest) {
+  const ip =
+    req.headers.get("x-forwarded-for")?.split(",")[0].trim() ??
+    req.headers.get("x-real-ip") ??
+    "unknown";
+
+  const authHeader = req.headers.get("Authorization");
+  let token = authHeader?.replace("Bearer ", "");
+  if (!token) token = req.cookies.get("token")?.value;
+
+  const decoded: any = getUserFromToken(token);
+  const userId = decoded?.id;
+
+  if (!userId) {
+    await logAttack({
+      type: "recon",
+      severity: "low",
+      ip,
+      detail: "Request with missing or invalid JWT — possible reconnaissance",
+      raw: { authHeader, token: token?.slice(0, 40) },
+    });
+    return NextResponse.json(
+      { success: false, message: "Unauthorized (no id in token)" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const db = await getDb();
+
+    // 🔴 FIX THIS: raw interpolation allows SQL injection + IDOR
+    // An attacker can forge a JWT with id=2 to read another user's data.
+    const query = \`
+      SELECT id, username, email, role, balance, account_number, created_at
+      FROM users
+      WHERE id=\${userId}
+    \`;
+    const [rows]: any = await db.query(query);
+
+    if (!rows || rows.length === 0) {
+      return NextResponse.json(
+        { success: false, message: "User not found" },
+        { status: 404 }
+      );
+    }
+
+    const dbUser = rows[0];
+
+    // 🔴 FIX THIS: no ownership check — any valid JWT (even forged) returns
+    // whatever row id the attacker injected. Add a check here.
+
+    const { forged, detail } = detectJwtForgery(decoded, dbUser);
+    if (forged) {
+      await logAttack({
+        type: decoded.role !== dbUser.role ? "jwt_forge" : "idor",
+        severity: "critical",
+        ip,
+        userId: String(decoded.id),
+        username: decoded.username ?? null,
+        detail,
+        raw: {
+          decodedId: decoded.id,
+          decodedRole: decoded.role,
+          dbId: dbUser.id,
+          dbRole: dbUser.role,
+          token: token?.slice(0, 60),
+        },
+      });
+    }
+
+    // 🔴 FIX THIS: never expose stack traces in production
+    return NextResponse.json({ success: true, user: dbUser });
+  } catch (err: any) {
+    return NextResponse.json(
+      { success: false, message: err.message, stack: err.stack },
+      { status: 500 }
+    );
+  }
+}`;
+
 // ─── Challenges map ───────────────────────────────────────────────────────────
 const CHALLENGES: Partial<Record<AttackType, Challenge>> = {
-  sqli: {
-    kind: "two-file",
-    title: "Fix SQL Injection — API route & login page",
+  sqli_login: {
+    kind: "two-file-sqli-login",
+    title: "Fix SQL Injection — Login API route & login page",
     description:
       "The login API builds queries via string concatenation, letting attackers bypass auth with payloads like admin'-- or ' OR '1'='1'--. Fix the route to use parameterized queries, remove the stack trace leak, and add client-side blocking in the login page.",
     points: 120,
-    routeStarterCode: SQLI_ROUTE_STARTER,
-    pageStarterCode: SQLI_PAGE_STARTER,
+    routeStarterCode: SQLI_LOGIN_ROUTE_STARTER,
+    pageStarterCode: SQLI_LOGIN_PAGE_STARTER,
     routeVulnCode: `// ❌ VULNERABLE — string concatenation
 const query = \`SELECT * FROM users
   WHERE username='\${username}'
@@ -397,61 +761,235 @@ const [rows]: any = await db.query(query);`,
     },
   },
 
-  jwt_forge: {
-    kind: "single",
-    title: "Fix: Weak JWT Verification",
+  sqli_search: {
+    kind: "two-file-sqli-search",
+    title: "Fix SQL Injection — Search API route & search page",
     description:
-      'The auth library accepts alg:"none" and uses a weak hardcoded secret. Fix jwt.verify() to enforce HS256 only and remove the fallback "secret".',
+      "The /api/search endpoint builds queries with raw string interpolation, allowing UNION-based data exfiltration (dumping all user credentials). Fix the route to use parameterized LIKE queries, remove the stack trace leak, and add client-side blocking on the search page.",
+    points: 130,
+    routeStarterCode: SQLI_SEARCH_ROUTE_STARTER,
+    pageStarterCode: SQLI_SEARCH_PAGE_STARTER,
+    routeVulnCode: `// ❌ VULNERABLE — raw interpolation in LIKE query
+const sql = \`SELECT id, username, email, role, balance, account_number
+  FROM users WHERE username LIKE '%\${query}%'\`;
+const [result]: any = await db.query(sql);`,
+    pageVulnCode: `// ❌ VULNERABLE — no client-side blocking when patched
+// runSearch() fires the API call even when sqliFixed=true and injection detected.`,
+    routeHints: [
+      "Replace the template literal with a parameterized LIKE query:",
+      `const [result]: any = await db.query(\n  "SELECT id, username, email, role, balance, account_number FROM users WHERE username LIKE ?",\n  [\`%\${query}%\`]\n);`,
+      "Also remove stack: err.stack from the catch block — never expose it in production responses.",
+    ],
+    pageHints: [
+      "Inside runSearch(), add a guard right after computing isInjection:",
+      `if (sqliFixed && isInjection) {\n  setAttackBlocked(true);\n  setLastAttack(query);\n  setSearched(false);\n  setResults([]);\n  pushRealAttack(query, false);\n  return;\n}`,
+    ],
+    validateRoute: (code) => {
+      const stillTemplate =
+        /`[^`]*\$\{query\}[^`]*`/.test(code) || /LIKE\s*'%\$\{/.test(code);
+      const hasParamLike =
+        /LIKE\s*\?/.test(code.replace(/\s+/g, " ")) ||
+        /db\.query\s*\([^,]+,\s*\[/.test(code);
+      const hasLikeParam =
+        /\`%\$\{query\}%\`/.test(code) ||
+        /\[`%\${query}%`\]/.test(code) ||
+        /\[`%\${/.test(code);
+      const hasStackLeak = /stack:\s*err\.stack/.test(code);
+      const hasConcat =
+        /LIKE\s*'%'\s*\+/.test(code) || /\+\s*query\s*\+/.test(code);
+      if (hasConcat)
+        return {
+          pass: false,
+          feedback:
+            "❌ Still concatenating strings in the LIKE clause — use ? placeholder.",
+        };
+      if (stillTemplate)
+        return {
+          pass: false,
+          feedback:
+            "❌ Still interpolating query into the SQL string — still injectable.",
+        };
+      if (!hasParamLike)
+        return {
+          pass: false,
+          feedback:
+            "❌ Missing ? placeholder. Use: WHERE username LIKE ? with [\`%${query}%\`].",
+        };
+      if (hasStackLeak)
+        return {
+          pass: false,
+          feedback:
+            "❌ Still leaking err.stack in the error response — remove it.",
+        };
+      return {
+        pass: true,
+        feedback:
+          "✅ Route fixed! Parameterized LIKE query active, no stack trace leak.",
+      };
+    },
+    validatePage: (code) => {
+      const hasBlockCheck =
+        /sqliFixed\s*&&\s*isInjection/.test(code) ||
+        /isInjection\s*&&\s*sqliFixed/.test(code);
+      const hasSetBlocked = /setAttackBlocked\s*\(\s*true\s*\)/.test(code);
+      const hasPushAttack = /pushRealAttack/.test(code);
+      const hasReturn =
+        /pushRealAttack[^}]+return/.test(code.replace(/\n/g, " ")) ||
+        (hasSetBlocked && /return/.test(code));
+      if (!hasBlockCheck)
+        return {
+          pass: false,
+          feedback:
+            "❌ Missing if (sqliFixed && isInjection) check in runSearch().",
+        };
+      if (!hasSetBlocked)
+        return {
+          pass: false,
+          feedback:
+            "❌ Need to call setAttackBlocked(true) when the patch is active.",
+        };
+      if (!hasPushAttack)
+        return {
+          pass: false,
+          feedback:
+            "❌ Call pushRealAttack(query, false) to log the blocked attempt.",
+        };
+      if (!hasReturn)
+        return {
+          pass: false,
+          feedback:
+            "❌ Must return early after blocking — don't let the fetch proceed.",
+        };
+      return {
+        pass: true,
+        feedback:
+          "✅ Page fixed! Client blocks and logs search injection attempts when patched.",
+      };
+    },
+  },
+
+  jwt_forge: {
+    kind: "two-file-jwt",
+    title: "Fix JWT Forgery — auth library & user API route",
+    description:
+      'The auth library accepts any algorithm (including "none") and falls back to the hardcoded secret "secret". The /api/user route also has raw SQL interpolation and no IDOR ownership check. Fix both files to close the attack chain.',
     points: 140,
-    vulnerableCode: `// ❌ VULNERABLE
-import jwt from 'jsonwebtoken';
-export function getUserFromToken(token: string) {
-  return jwt.verify(token, process.env.JWT_SECRET || 'secret');
-}`,
-    starterCode: `// ✅ YOUR FIX — enforce algorithm, remove weak fallback
-import jwt from 'jsonwebtoken';
-export function getUserFromToken(token: string) {
-  return jwt.verify(token, process.env.JWT_SECRET!, {
-    algorithms: [/* specify allowed algorithm here */],
-  });
-}`,
-    validate: (code) => {
+    authStarterCode: JWT_AUTH_STARTER,
+    routeStarterCode: JWT_ROUTE_STARTER,
+    authVulnCode: `// ❌ VULNERABLE — accepts alg:"none", weak fallback secret
+return jwt.verify(token, process.env.JWT_SECRET || 'secret');`,
+    routeVulnCode: `// ❌ VULNERABLE — raw interpolation + no ownership check
+const query = \`SELECT ... WHERE id=\${userId}\`;
+// no check: dbUser.id !== decoded.id`,
+    authHints: [
+      "Pass an options object to jwt.verify() that locks the allowed algorithm:",
+      `export function getUserFromToken(token: string) {\n  return jwt.verify(token, process.env.JWT_SECRET!, {\n    algorithms: ["HS256"],\n  });\n}`,
+      'Also fix signToken() — remove the || "secret" fallback from both calls. The ! assertion tells TypeScript the env var is always set.',
+    ],
+    routeHints: [
+      "Replace the template literal with a parameterized query:",
+      `const query = "SELECT id, username, email, role, balance, account_number, created_at FROM users WHERE id = ?";\nconst [rows]: any = await db.query(query, [userId]);`,
+      "After fetching dbUser, add an ownership check and remove the stack trace leak:",
+      `if (!dbUser || String(dbUser.id) !== String(decoded.id)) {\n  return NextResponse.json(\n    { success: false, message: "Forbidden" },\n    { status: 403 }\n  );\n}\n// In the catch block, remove: stack: err.stack`,
+    ],
+    validateAuth: (code) => {
       const hasAlgorithms = /algorithms\s*:\s*\[/.test(code);
       const hasHS256 = /['"]HS256['"]/.test(code);
       const hasNone = /['"]none['"]/.test(code);
-      const stillWeak = /\|\|\s*['"]secret['"]/.test(code);
+      const stillWeakVerify =
+        /jwt\.verify\s*\([^,]+,\s*(process\.env\.JWT_SECRET\s*\|\|[^)]+|['"]secret['"])\s*\)/.test(
+          code.replace(/\s+/g, " "),
+        );
+      const stillWeakSign =
+        /jwt\.sign\s*\([^,]+,\s*process\.env\.JWT_SECRET\s*\|\|/.test(
+          code.replace(/\s+/g, " "),
+        );
       if (hasNone)
         return {
           pass: false,
           feedback: '❌ "none" is still in the algorithms list — remove it.',
         };
-      if (stillWeak)
+      if (stillWeakVerify)
         return {
           pass: false,
           feedback:
-            '❌ Still falling back to "secret". Use process.env.JWT_SECRET! instead.',
+            '❌ jwt.verify() still uses || "secret" fallback. Use process.env.JWT_SECRET! instead.',
         };
       if (!hasAlgorithms)
         return {
           pass: false,
-          feedback: "❌ Missing algorithms: [...] option in jwt.verify().",
+          feedback: '❌ Missing algorithms: ["HS256"] option in jwt.verify().',
         };
       if (!hasHS256)
         return {
           pass: false,
           feedback: '❌ Specify "HS256" as the only allowed algorithm.',
         };
+      if (stillWeakSign)
+        return {
+          pass: false,
+          feedback:
+            '❌ signToken() still has || "secret" fallback — fix it too.',
+        };
+      return {
+        pass: true,
+        feedback: "✅ Auth fixed! HS256 enforced, weak secret removed.",
+      };
+    },
+    validateRoute: (code) => {
+      const hasParamQuery =
+        /query\s*\(\s*['"`][^'"`]*WHERE id\s*=\s*\?['"`]/.test(
+          code.replace(/\s+/g, " "),
+        ) ||
+        /db\.query\s*\([^,]+,\s*\[userId\]/.test(code.replace(/\s+/g, " "));
+      const stillInterpolated =
+        /WHERE id=\$\{/.test(code) ||
+        /WHERE id='\$/.test(code) ||
+        /`[^`]*\$\{userId\}[^`]*`/.test(code);
+      const has403 = /403/.test(code);
+      const hasForbidden = /[Ff]orbidden/.test(code);
+      const hasOwnershipCheck =
+        /dbUser\.id.*decoded\.id/.test(code.replace(/\s+/g, " ")) ||
+        /decoded\.id.*dbUser\.id/.test(code.replace(/\s+/g, " ")) ||
+        /String\(dbUser\.id\).*String\(decoded\.id\)/.test(
+          code.replace(/\s+/g, " "),
+        );
+      const hasStackLeak = /stack:\s*err\.stack/.test(code);
+      if (stillInterpolated)
+        return {
+          pass: false,
+          feedback:
+            "❌ Still using string interpolation in the SQL query — use ? placeholder.",
+        };
+      if (!hasParamQuery)
+        return {
+          pass: false,
+          feedback: "❌ Use: db.query('SELECT ... WHERE id = ?', [userId])",
+        };
+      if (!hasOwnershipCheck)
+        return {
+          pass: false,
+          feedback:
+            "❌ Add an ownership check: if dbUser.id !== decoded.id → return 403.",
+        };
+      if (!has403 || !hasForbidden)
+        return {
+          pass: false,
+          feedback:
+            "❌ Return a 403 Forbidden response when the ownership check fails.",
+        };
+      if (hasStackLeak)
+        return {
+          pass: false,
+          feedback:
+            "❌ Still leaking err.stack in the catch block — remove it.",
+        };
       return {
         pass: true,
         feedback:
-          "✅ Correct! Restricting to HS256 prevents algorithm confusion and alg:none attacks.",
+          "✅ Route fixed! Parameterized query + ownership check + no stack leak.",
       };
     },
-    hints: [
-      'Add algorithms: ["HS256"] to the jwt.verify() options object.',
-      'Remove the || "secret" fallback — use process.env.JWT_SECRET! (the ! asserts it is defined).',
-      `The fixed call looks like:\njwt.verify(token, process.env.JWT_SECRET!, {\n  algorithms: ["HS256"],\n});`,
-    ],
   },
 
   xss: {
@@ -632,7 +1170,7 @@ const ATTACK_TEMPLATES: Omit<
     payload: '{"alg":"none","typ":"JWT"}.{"id":7,"role":"admin"}. [empty sig]',
   },
   {
-    type: "sqli",
+    type: "sqli_login",
     severity: "critical",
     user: "SQLSlayer99",
     detail:
@@ -643,7 +1181,7 @@ const ATTACK_TEMPLATES: Omit<
     payload: "username=' OR '1'='1'-- &password=doesntmatter",
   },
   {
-    type: "sqli",
+    type: "sqli_login",
     severity: "critical",
     user: "ad_min_pwn",
     detail:
@@ -654,11 +1192,11 @@ const ATTACK_TEMPLATES: Omit<
     payload: "username=admin'-- &password=anything",
   },
   {
-    type: "sqli",
+    type: "sqli_search",
     severity: "critical",
     user: "bl1nd_injector",
     detail:
-      "Blind boolean-based SQLi — extracting password hash character by character",
+      "Blind boolean-based SQLi — extracting password hash character by character via /api/search",
     endpoint: "/api/search",
     method: "GET",
     statusCode: 200,
@@ -666,15 +1204,16 @@ const ATTACK_TEMPLATES: Omit<
       "query=' AND (SELECT SUBSTRING(password,1,1) FROM users LIMIT 1)='a'-- ",
   },
   {
-    type: "sqli",
+    type: "sqli_search",
     severity: "high",
     user: "UnionJack_h4x",
-    detail: "UNION-based SQLi — dumping table names from information_schema",
+    detail:
+      "UNION-based SQLi on /api/search — dumping all user credentials from DB",
     endpoint: "/api/search",
     method: "GET",
     statusCode: 200,
     payload:
-      "query=' UNION SELECT table_name,2,3,4,5,6 FROM information_schema.tables-- ",
+      "query=' UNION SELECT id,username,password,email,balance,account_number FROM users-- ",
   },
   {
     type: "idor",
@@ -760,7 +1299,8 @@ const SEV_CONFIG: Record<
 
 const TYPE_LABELS: Record<AttackType, string> = {
   jwt_forge: "JWT FORGERY",
-  sqli: "SQL INJECTION",
+  sqli_login: "SQLI — LOGIN",
+  sqli_search: "SQLI — SEARCH",
   idor: "IDOR ATTACK",
   xss: "XSS INJECTION",
 };
@@ -770,39 +1310,35 @@ const TYPE_COLORS: Record<
   { text: string; bg: string; border: string }
 > = {
   jwt_forge: { text: "#7c3aed", bg: "#f5f3ff", border: "#c4b5fd" },
-  sqli: { text: "#b91c1c", bg: "#fff1f1", border: "#fca5a5" },
+  sqli_login: { text: "#b91c1c", bg: "#fff1f1", border: "#fca5a5" },
+  sqli_search: { text: "#be185d", bg: "#fdf2f8", border: "#f9a8d4" },
   idor: { text: "#0369a1", bg: "#eff6ff", border: "#bae6fd" },
   xss: { text: "#c2410c", bg: "#fff7ed", border: "#fed7aa" },
 };
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
 const mono = "'JetBrains Mono', 'Fira Code', monospace";
 const sans = "'IBM Plex Sans', system-ui, sans-serif";
 
-// Challenge modal palette (dark)
-// Challenge modal palette (Cyber-Arena / Glassmorphism)
-// Challenge modal palette (Professional Dark Glass)
-// Clean, Professional SaaS Palette
 const C = {
-  bg0: "#09090b", // Deepest background
-  bg1: "#18181b", // Card/Modal background
-  bg2: "#27272a", // Elevated surfaces
-  bg3: "#3f3f46", // UI element background
-  border: "#27272a", // Subtle borders
-  border2: "#3f3f46", // Stronger borders
-  green: "#10b981", // Professional emerald
+  bg0: "#09090b",
+  bg1: "#18181b",
+  bg2: "#27272a",
+  bg3: "#3f3f46",
+  border: "#27272a",
+  border2: "#3f3f46",
+  green: "#10b981",
   greenDim: "rgba(16, 185, 129, 0.1)",
   greenBorder: "rgba(16, 185, 129, 0.2)",
-  red: "#ef4444", // Clean danger red
+  red: "#ef4444",
   redDim: "rgba(239, 68, 68, 0.1)",
-  amber: "#f59e0b", // Warning amber
+  amber: "#f59e0b",
   amberDim: "rgba(245, 158, 11, 0.1)",
-  purple: "#8b5cf6", // Accent violet
-  blue: "#3b82f6", // Primary blue
-  text0: "#fafafa", // Primary text
-  text1: "#a1a1aa", // Secondary text
-  text2: "#71717a", // Tertiary text
-  text3: "#52525b", // Muted text
+  purple: "#8b5cf6",
+  blue: "#3b82f6",
+  text0: "#fafafa",
+  text1: "#a1a1aa",
+  text2: "#71717a",
+  text3: "#52525b",
 };
 
 // ─── Main Component ───────────────────────────────────────────────────────────
@@ -818,7 +1354,6 @@ export default function DefensePage() {
   const [patchedTypes, setPatchedTypes] = useState<Set<AttackType>>(new Set());
   const [filterTab, setFilterTab] = useState<FilterTab>("all");
 
-  // Challenge modal state
   const [challengeOpen, setChallengeOpen] = useState(false);
   const [challengeType, setChallengeType] = useState<AttackType | null>(null);
   const [challengeResult, setChallengeResult] =
@@ -829,15 +1364,37 @@ export default function DefensePage() {
   const [challengeFeedback, setChallengeFeedback] = useState("");
   const [showHint, setShowHint] = useState(false);
 
-  // Two-file SQLi state
-  const [sqliActiveTab, setSqliActiveTab] = useState<SqliFileTab>("route");
-  const [sqliRouteCode, setSqliRouteCode] = useState("");
-  const [sqliPageCode, setSqliPageCode] = useState("");
-  const [sqliRouteOk, setSqliRouteOk] = useState(false);
-  const [sqliPageOk, setSqliPageOk] = useState(false);
-  const [sqliRouteFeedback, setSqliRouteFeedback] = useState("");
-  const [sqliPageFeedback, setSqliPageFeedback] = useState("");
-  const [sqliShowHint, setSqliShowHint] = useState(false);
+  // Two-file SQLi Login state
+  const [sqliLoginActiveTab, setSqliLoginActiveTab] =
+    useState<SqliLoginFileTab>("route");
+  const [sqliLoginRouteCode, setSqliLoginRouteCode] = useState("");
+  const [sqliLoginPageCode, setSqliLoginPageCode] = useState("");
+  const [sqliLoginRouteOk, setSqliLoginRouteOk] = useState(false);
+  const [sqliLoginPageOk, setSqliLoginPageOk] = useState(false);
+  const [sqliLoginRouteFeedback, setSqliLoginRouteFeedback] = useState("");
+  const [sqliLoginPageFeedback, setSqliLoginPageFeedback] = useState("");
+  const [sqliLoginShowHint, setSqliLoginShowHint] = useState(false);
+
+  // Two-file SQLi Search state
+  const [sqliSearchActiveTab, setSqliSearchActiveTab] =
+    useState<SqliSearchFileTab>("route");
+  const [sqliSearchRouteCode, setSqliSearchRouteCode] = useState("");
+  const [sqliSearchPageCode, setSqliSearchPageCode] = useState("");
+  const [sqliSearchRouteOk, setSqliSearchRouteOk] = useState(false);
+  const [sqliSearchPageOk, setSqliSearchPageOk] = useState(false);
+  const [sqliSearchRouteFeedback, setSqliSearchRouteFeedback] = useState("");
+  const [sqliSearchPageFeedback, setSqliSearchPageFeedback] = useState("");
+  const [sqliSearchShowHint, setSqliSearchShowHint] = useState(false);
+
+  // Two-file JWT state
+  const [jwtActiveTab, setJwtActiveTab] = useState<JwtFileTab>("auth");
+  const [jwtAuthCode, setJwtAuthCode] = useState("");
+  const [jwtRouteCode, setJwtRouteCode] = useState("");
+  const [jwtAuthOk, setJwtAuthOk] = useState(false);
+  const [jwtRouteOk, setJwtRouteOk] = useState(false);
+  const [jwtAuthFeedback, setJwtAuthFeedback] = useState("");
+  const [jwtRouteFeedback, setJwtRouteFeedback] = useState("");
+  const [jwtShowHint, setJwtShowHint] = useState(false);
 
   const toastTimer = useRef<NodeJS.Timeout | null>(null);
   const seenRealIds = useRef<Set<string>>(new Set());
@@ -847,18 +1404,50 @@ export default function DefensePage() {
     patchedTypesRef.current = patchedTypes;
   }, [patchedTypes]);
 
-  // Poll real attack log
+  // Poll for real attacks from localStorage
   useEffect(() => {
     const poll = setInterval(() => {
       try {
         const raw = localStorage.getItem("real_attack_log");
         if (!raw) return;
-        const events: LogEntry[] = JSON.parse(raw);
+        const events: any[] = JSON.parse(raw);
         const fresh = events.filter((e) => !seenRealIds.current.has(e.id));
         if (!fresh.length) return;
         fresh.forEach((e) => seenRealIds.current.add(e.id));
-        setLogs((prev) => [...fresh, ...prev].slice(0, 150));
-        if (fresh.some((e) => e.severity === "critical")) {
+        // Normalize legacy "sqli" type from search page to "sqli_search"
+        const normalized: LogEntry[] = fresh.map((e) => {
+          if (
+            e.type === "sqli" &&
+            (e.endpoint === "/api/search" ||
+              (e.detail && e.detail.includes("/api/search")) ||
+              e.detail.includes("search"))
+          ) {
+            return { ...e, type: "sqli_search" as AttackType };
+          }
+          if (
+            e.type === "sqli" &&
+            (e.endpoint === "/api/login" ||
+              (e.detail && e.detail.includes("login")) ||
+              e.detail.includes("Auth bypass"))
+          ) {
+            return { ...e, type: "sqli_login" as AttackType };
+          }
+          if (e.type === "sqli") {
+            // fallback: check payload/detail for search indicators
+            const isSrc =
+              (e.payload && e.payload.includes("query=")) ||
+              (e.detail && e.detail.toLowerCase().includes("search"));
+            return {
+              ...e,
+              type: isSrc
+                ? ("sqli_search" as AttackType)
+                : ("sqli_login" as AttackType),
+            };
+          }
+          return e as LogEntry;
+        });
+        setLogs((prev) => [...normalized, ...prev].slice(0, 150));
+        if (normalized.some((e) => e.severity === "critical")) {
           setAlertFlash(true);
           setTimeout(() => setAlertFlash(false), 600);
         }
@@ -948,22 +1537,42 @@ export default function DefensePage() {
     setChallengeOpen(true);
     setShowHint(false);
     setChallengeFeedback("");
-    if (ch.kind === "two-file") {
-      setSqliActiveTab("route");
-      setSqliRouteCode(ch.routeStarterCode);
-      setSqliPageCode(ch.pageStarterCode);
-      setSqliRouteOk(false);
-      setSqliPageOk(false);
-      setSqliRouteFeedback("");
-      setSqliPageFeedback("");
-      setSqliShowHint(false);
+
+    if (ch.kind === "two-file-sqli-login") {
+      setSqliLoginActiveTab("route");
+      setSqliLoginRouteCode(ch.routeStarterCode);
+      setSqliLoginPageCode(ch.pageStarterCode);
+      setSqliLoginRouteOk(false);
+      setSqliLoginPageOk(false);
+      setSqliLoginRouteFeedback("");
+      setSqliLoginPageFeedback("");
+      setSqliLoginShowHint(false);
+    } else if (ch.kind === "two-file-sqli-search") {
+      setSqliSearchActiveTab("route");
+      setSqliSearchRouteCode(ch.routeStarterCode);
+      setSqliSearchPageCode(ch.pageStarterCode);
+      setSqliSearchRouteOk(false);
+      setSqliSearchPageOk(false);
+      setSqliSearchRouteFeedback("");
+      setSqliSearchPageFeedback("");
+      setSqliSearchShowHint(false);
+    } else if (ch.kind === "two-file-jwt") {
+      setJwtActiveTab("auth");
+      setJwtAuthCode(ch.authStarterCode);
+      setJwtRouteCode(ch.routeStarterCode);
+      setJwtAuthOk(false);
+      setJwtRouteOk(false);
+      setJwtAuthFeedback("");
+      setJwtRouteFeedback("");
+      setJwtShowHint(false);
     } else {
-      setChallengeCode(ch.starterCode);
+      setChallengeCode((ch as SingleSnippetChallenge).starterCode);
     }
   }
 
   const PATCH_TARGET_MAP: Partial<Record<AttackType, string>> = {
-    sqli: "sqli",
+    sqli_login: "sqli",
+    sqli_search: "sqli_search",
     jwt_forge: "jwt",
     xss: "xss",
     idor: "idor",
@@ -1002,30 +1611,93 @@ export default function DefensePage() {
     if (!challengeType || !challenge || challenge.kind !== "single") return;
     setChallengeResult("running");
     setTimeout(() => {
-      const result = challenge.validate(challengeCode);
+      const result = (challenge as SingleSnippetChallenge).validate(
+        challengeCode,
+      );
       setChallengeResult(result.pass ? "pass" : "fail");
       setChallengeFeedback(result.feedback);
       if (result.pass) applyPatch(challengeType, challenge.points);
     }, 700);
   }
 
-  function submitSqliChallenge() {
-    if (!challengeType || !challenge || challenge.kind !== "two-file") return;
+  function submitSqliLoginChallenge() {
+    if (
+      !challengeType ||
+      !challenge ||
+      challenge.kind !== "two-file-sqli-login"
+    )
+      return;
     setChallengeResult("running");
     setTimeout(() => {
-      const rv = challenge.validateRoute(sqliRouteCode);
-      const pv = challenge.validatePage(sqliPageCode);
-      setSqliRouteFeedback(rv.feedback);
-      setSqliPageFeedback(pv.feedback);
-      setSqliRouteOk(rv.pass);
-      setSqliPageOk(pv.pass);
+      const rv = (challenge as TwoFileSqliLoginChallenge).validateRoute(
+        sqliLoginRouteCode,
+      );
+      const pv = (challenge as TwoFileSqliLoginChallenge).validatePage(
+        sqliLoginPageCode,
+      );
+      setSqliLoginRouteFeedback(rv.feedback);
+      setSqliLoginPageFeedback(pv.feedback);
+      setSqliLoginRouteOk(rv.pass);
+      setSqliLoginPageOk(pv.pass);
       if (rv.pass && pv.pass) {
         setChallengeResult("pass");
         applyPatch(challengeType, challenge.points);
       } else {
         setChallengeResult("fail");
-        if (!rv.pass) setSqliActiveTab("route");
-        else if (!pv.pass) setSqliActiveTab("page");
+        if (!rv.pass) setSqliLoginActiveTab("route");
+        else if (!pv.pass) setSqliLoginActiveTab("page");
+      }
+    }, 700);
+  }
+
+  function submitSqliSearchChallenge() {
+    if (
+      !challengeType ||
+      !challenge ||
+      challenge.kind !== "two-file-sqli-search"
+    )
+      return;
+    setChallengeResult("running");
+    setTimeout(() => {
+      const rv = (challenge as TwoFileSqliSearchChallenge).validateRoute(
+        sqliSearchRouteCode,
+      );
+      const pv = (challenge as TwoFileSqliSearchChallenge).validatePage(
+        sqliSearchPageCode,
+      );
+      setSqliSearchRouteFeedback(rv.feedback);
+      setSqliSearchPageFeedback(pv.feedback);
+      setSqliSearchRouteOk(rv.pass);
+      setSqliSearchPageOk(pv.pass);
+      if (rv.pass && pv.pass) {
+        setChallengeResult("pass");
+        applyPatch(challengeType, challenge.points);
+      } else {
+        setChallengeResult("fail");
+        if (!rv.pass) setSqliSearchActiveTab("route");
+        else if (!pv.pass) setSqliSearchActiveTab("page");
+      }
+    }, 700);
+  }
+
+  function submitJwtChallenge() {
+    if (!challengeType || !challenge || challenge.kind !== "two-file-jwt")
+      return;
+    setChallengeResult("running");
+    setTimeout(() => {
+      const av = (challenge as TwoFileJwtChallenge).validateAuth(jwtAuthCode);
+      const rv = (challenge as TwoFileJwtChallenge).validateRoute(jwtRouteCode);
+      setJwtAuthFeedback(av.feedback);
+      setJwtRouteFeedback(rv.feedback);
+      setJwtAuthOk(av.pass);
+      setJwtRouteOk(rv.pass);
+      if (av.pass && rv.pass) {
+        setChallengeResult("pass");
+        applyPatch(challengeType, challenge.points);
+      } else {
+        setChallengeResult("fail");
+        if (!av.pass) setJwtActiveTab("auth");
+        else if (!rv.pass) setJwtActiveTab("route");
       }
     }, 700);
   }
@@ -1036,11 +1708,21 @@ export default function DefensePage() {
     setChallengeResult("idle");
     setChallengeFeedback("");
     setShowHint(false);
-    setSqliRouteFeedback("");
-    setSqliPageFeedback("");
-    setSqliRouteOk(false);
-    setSqliPageOk(false);
-    setSqliShowHint(false);
+    setSqliLoginRouteFeedback("");
+    setSqliLoginPageFeedback("");
+    setSqliLoginRouteOk(false);
+    setSqliLoginPageOk(false);
+    setSqliLoginShowHint(false);
+    setSqliSearchRouteFeedback("");
+    setSqliSearchPageFeedback("");
+    setSqliSearchRouteOk(false);
+    setSqliSearchPageOk(false);
+    setSqliSearchShowHint(false);
+    setJwtAuthFeedback("");
+    setJwtRouteFeedback("");
+    setJwtAuthOk(false);
+    setJwtRouteOk(false);
+    setJwtShowHint(false);
   }
 
   const fmt = (ts: number) =>
@@ -1071,8 +1753,8 @@ export default function DefensePage() {
     fixed: logs.filter((l) => patchedTypes.has(l.type)).length,
   };
 
-  // ─── Diff view for SQLi route ────────────────────────────────────────────
-  function renderSqliDiff(ch: TwoFileSqliChallenge) {
+  // ─── Diff view for SQLi Login ─────────────────────────────────────────────
+  function renderSqliLoginDiff(ch: TwoFileSqliLoginChallenge) {
     const lines = ch.routeStarterCode.split("\n");
     const badPattern =
       /`SELECT \* FROM users|WHERE username='\$\{|AND password='\$\{|stack:\s*err\.stack/;
@@ -1088,70 +1770,25 @@ export default function DefensePage() {
     ];
     return (
       <div style={{ flex: 1, overflowY: "auto", background: C.bg0 }}>
-        <div
-          style={{
-            padding: "10px 20px",
-            fontSize: 10,
-            fontWeight: 700,
-            letterSpacing: ".1em",
-            color: C.red,
-            borderBottom: `1px solid rgba(248,113,113,0.15)`,
-            background: "rgba(248,113,113,0.04)",
-          }}
-        >
-          VULNERABLE LINES (highlighted) — route.ts
-        </div>
+        <DiffHeader
+          label="VULNERABLE LINES — api/login/route.ts"
+          color={C.red}
+        />
         <div style={{ fontFamily: mono, fontSize: 12, lineHeight: 1.8 }}>
-          {lines.map((line, i) => {
-            const isBad = badPattern.test(line);
-            return (
-              <div
-                key={i}
-                style={{ display: "grid", gridTemplateColumns: "44px 1fr" }}
-              >
-                <span
-                  style={{
-                    color: C.text3,
-                    padding: "0 12px",
-                    textAlign: "right",
-                    userSelect: "none",
-                    fontSize: 11,
-                  }}
-                >
-                  {i + 1}
-                </span>
-                <span
-                  style={{
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-all",
-                    paddingRight: 20,
-                    background: isBad
-                      ? "rgba(248,113,113,0.13)"
-                      : "transparent",
-                    color: isBad ? "#fca5a5" : C.text2,
-                  }}
-                >
-                  {line || " "}
-                </span>
-              </div>
-            );
-          })}
+          {lines.map((line, i) => (
+            <DiffLine
+              key={i}
+              line={line}
+              num={i + 1}
+              bad={badPattern.test(line)}
+            />
+          ))}
         </div>
-        <div
-          style={{
-            padding: "10px 20px",
-            fontSize: 10,
-            fontWeight: 700,
-            letterSpacing: ".1em",
-            color: C.green,
-            borderTop: `1px solid rgba(74,222,128,0.15)`,
-            borderBottom: `1px solid rgba(74,222,128,0.15)`,
-            marginTop: 12,
-            background: "rgba(74,222,128,0.04)",
-          }}
-        >
-          REQUIRED FIX — replace the red lines with these
-        </div>
+        <DiffHeader
+          label="REQUIRED FIX — replace the red lines with these"
+          color={C.green}
+          top
+        />
         <div
           style={{
             fontFamily: mono,
@@ -1161,41 +1798,160 @@ export default function DefensePage() {
           }}
         >
           {fixLines.map((line, i) => (
-            <div
-              key={i}
-              style={{ display: "grid", gridTemplateColumns: "44px 1fr" }}
-            >
-              <span
-                style={{
-                  color: C.green,
-                  padding: "0 12px",
-                  textAlign: "right",
-                  opacity: 0.5,
-                  fontSize: 11,
-                }}
-              >
-                +
-              </span>
-              <span
-                style={{
-                  whiteSpace: "pre-wrap",
-                  color: "#86efac",
-                  background: "rgba(74,222,128,0.08)",
-                  paddingRight: 20,
-                }}
-              >
-                {line || " "}
-              </span>
-            </div>
+            <DiffFixLine key={i} line={line} />
           ))}
         </div>
       </div>
     );
   }
 
-  // ─── Hint panel content ───────────────────────────────────────────────────
+  // ─── Diff view for SQLi Search ────────────────────────────────────────────
+  function renderSqliSearchDiff(ch: TwoFileSqliSearchChallenge) {
+    const lines = ch.routeStarterCode.split("\n");
+    const badPattern =
+      /LIKE\s*'%\$\{|`[^`]*\$\{query\}[^`]*`|stack:\s*err\.stack/;
+    const fixLines = [
+      "    // ✅ FIXED — parameterized LIKE query, no interpolation",
+      "    const [result]: any = await db.query(",
+      '      "SELECT id, username, email, role, balance, account_number FROM users WHERE username LIKE ?",',
+      "      [`%${query}%`]",
+      "    );",
+      "    rows = result;",
+      "",
+      "    // Error handler — no stack leak:",
+      "    return NextResponse.json(",
+      "      { success: false, message: err.message },",
+      "      { status: 500 }",
+      "    );",
+    ];
+    return (
+      <div style={{ flex: 1, overflowY: "auto", background: C.bg0 }}>
+        <DiffHeader
+          label="VULNERABLE LINES — api/search/route.ts"
+          color={C.red}
+        />
+        <div style={{ fontFamily: mono, fontSize: 12, lineHeight: 1.8 }}>
+          {lines.map((line, i) => (
+            <DiffLine
+              key={i}
+              line={line}
+              num={i + 1}
+              bad={badPattern.test(line)}
+            />
+          ))}
+        </div>
+        <DiffHeader
+          label="REQUIRED FIX — replace the red lines with these"
+          color={C.green}
+          top
+        />
+        <div
+          style={{
+            fontFamily: mono,
+            fontSize: 12,
+            lineHeight: 1.8,
+            paddingBottom: 20,
+          }}
+        >
+          {fixLines.map((line, i) => (
+            <DiffFixLine key={i} line={line} />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Diff view for JWT ────────────────────────────────────────────────────
+  function renderJwtDiff(ch: TwoFileJwtChallenge) {
+    const authLines = ch.authStarterCode.split("\n");
+    const routeLines = ch.routeStarterCode.split("\n");
+    const authBadPattern = /jwt\.verify\s*\(|process\.env\.JWT_SECRET\s*\|\|/;
+    const routeBadPattern =
+      /WHERE id=\$\{|`[^`]*\$\{userId\}|stack:\s*err\.stack/;
+    const authFix = [
+      "export function getUserFromToken(token: string) {",
+      "  return jwt.verify(token, process.env.JWT_SECRET!, {",
+      '    algorithms: ["HS256"],',
+      "  });",
+      "}",
+      "",
+      "export function signToken(payload: object) {",
+      "  return jwt.sign(payload, process.env.JWT_SECRET!, { expiresIn: '7d' });",
+      "}",
+    ];
+    const routeFix = [
+      '    const query = "SELECT id, username, email, role, balance, account_number, created_at FROM users WHERE id = ?";',
+      "    const [rows]: any = await db.query(query, [userId]);",
+      "    // ...",
+      "    if (!dbUser || String(dbUser.id) !== String(decoded.id)) {",
+      '      return NextResponse.json({ success: false, message: "Forbidden" }, { status: 403 });',
+      "    }",
+      "    // In catch: remove stack: err.stack",
+    ];
+    return (
+      <div style={{ flex: 1, overflowY: "auto", background: C.bg0 }}>
+        <DiffHeader label="VULNERABLE LINES — lib/auth.ts" color={C.red} />
+        <div style={{ fontFamily: mono, fontSize: 12, lineHeight: 1.8 }}>
+          {authLines.map((line, i) => (
+            <DiffLine
+              key={i}
+              line={line}
+              num={i + 1}
+              bad={authBadPattern.test(line)}
+            />
+          ))}
+        </div>
+        <DiffHeader label="REQUIRED FIX — lib/auth.ts" color={C.green} top />
+        <div
+          style={{
+            fontFamily: mono,
+            fontSize: 12,
+            lineHeight: 1.8,
+            paddingBottom: 12,
+          }}
+        >
+          {authFix.map((line, i) => (
+            <DiffFixLine key={i} line={line} />
+          ))}
+        </div>
+        <DiffHeader
+          label="VULNERABLE LINES — app/api/user/route.ts"
+          color={C.red}
+          top
+        />
+        <div style={{ fontFamily: mono, fontSize: 12, lineHeight: 1.8 }}>
+          {routeLines.map((line, i) => (
+            <DiffLine
+              key={i}
+              line={line}
+              num={i + 1}
+              bad={routeBadPattern.test(line)}
+            />
+          ))}
+        </div>
+        <DiffHeader
+          label="REQUIRED FIX — app/api/user/route.ts"
+          color={C.green}
+          top
+        />
+        <div
+          style={{
+            fontFamily: mono,
+            fontSize: 12,
+            lineHeight: 1.8,
+            paddingBottom: 20,
+          }}
+        >
+          {routeFix.map((line, i) => (
+            <DiffFixLine key={i} line={line} />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Hint panel ───────────────────────────────────────────────────────────
   function renderHints(hints: string[]) {
-    // hints array: [prose line, optional code block, prose line, ...]
     return (
       <div
         style={{
@@ -1226,7 +1982,6 @@ export default function DefensePage() {
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {hints.map((h, i) => {
-            // If the hint contains a newline it's a code snippet
             const isCode = h.includes("\n");
             return isCode ? (
               <pre
@@ -1266,11 +2021,66 @@ export default function DefensePage() {
     );
   }
 
-  // ─── Right sidebar — challenge board & effects ────────────────────────────
-  function renderRightPane(ch: Challenge, isTwoFile: boolean) {
-    const bothPass = sqliRouteOk && sqliPageOk;
-    const singlePass = challengeResult === "pass";
-    const isPassed = isTwoFile ? bothPass : singlePass;
+  // ─── Right sidebar ────────────────────────────────────────────────────────
+  function renderRightPane(
+    ch: Challenge,
+    submitFn: () => void,
+    isPassed: boolean,
+  ) {
+    const getFileStatuses = () => {
+      if (ch.kind === "two-file-sqli-login")
+        return [
+          {
+            key: "route",
+            label: "route.ts",
+            ok: sqliLoginRouteOk,
+            fb: sqliLoginRouteFeedback,
+            dot: C.purple,
+          },
+          {
+            key: "page",
+            label: "page.tsx",
+            ok: sqliLoginPageOk,
+            fb: sqliLoginPageFeedback,
+            dot: C.blue,
+          },
+        ];
+      if (ch.kind === "two-file-sqli-search")
+        return [
+          {
+            key: "route",
+            label: "api/search/route.ts",
+            ok: sqliSearchRouteOk,
+            fb: sqliSearchRouteFeedback,
+            dot: C.purple,
+          },
+          {
+            key: "page",
+            label: "search/page.tsx",
+            ok: sqliSearchPageOk,
+            fb: sqliSearchPageFeedback,
+            dot: C.blue,
+          },
+        ];
+      if (ch.kind === "two-file-jwt")
+        return [
+          {
+            key: "auth",
+            label: "lib/auth.ts",
+            ok: jwtAuthOk,
+            fb: jwtAuthFeedback,
+            dot: C.purple,
+          },
+          {
+            key: "route",
+            label: "api/user/route.ts",
+            ok: jwtRouteOk,
+            fb: jwtRouteFeedback,
+            dot: C.blue,
+          },
+        ];
+      return [];
+    };
 
     return (
       <div
@@ -1283,11 +2093,9 @@ export default function DefensePage() {
           background: C.bg1,
         }}
       >
-        {/* Run validator */}
         <div style={{ padding: "20px 20px 0", flexShrink: 0 }}>
-          {/* Inside renderRightPane: */}
           <button
-            onClick={isTwoFile ? submitSqliChallenge : submitChallenge}
+            onClick={submitFn}
             disabled={challengeResult === "running" || isPassed}
             style={{
               fontFamily: sans,
@@ -1326,8 +2134,8 @@ export default function DefensePage() {
                 ? "✓ System Secured"
                 : "Deploy Hotfix"}
           </button>
-          {/* Single result feedback */}
-          {!isTwoFile && challengeFeedback && (
+
+          {ch.kind === "single" && challengeFeedback && (
             <div
               style={{
                 marginTop: 12,
@@ -1335,7 +2143,7 @@ export default function DefensePage() {
                 borderRadius: 8,
                 fontSize: 12,
                 lineHeight: 1.65,
-                ...(singlePass
+                ...(challengeResult === "pass"
                   ? {
                       background: C.greenDim,
                       border: `1px solid ${C.greenBorder}`,
@@ -1351,82 +2159,84 @@ export default function DefensePage() {
               {challengeFeedback}
             </div>
           )}
-          {/* Two-file status cards */}
-          {isTwoFile && (
-            <div
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: 8,
-                marginTop: 14,
-              }}
-            >
-              {(["route", "page"] as const).map((f) => {
-                const ok = f === "route" ? sqliRouteOk : sqliPageOk;
-                const fb = f === "route" ? sqliRouteFeedback : sqliPageFeedback;
-                const label = f === "route" ? "route.ts" : "page.tsx";
-                const dotColor = f === "route" ? C.purple : C.blue;
-                const status = ok ? "fixed" : fb ? "needs fix" : "pending";
-                return (
-                  <div
-                    key={f}
-                    style={{
-                      background: C.bg0,
-                      borderRadius: 8,
-                      border: `1px solid ${ok ? C.greenBorder : fb ? "rgba(248,113,113,0.2)" : C.border}`,
-                      padding: "10px 13px",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                    }}
-                  >
+
+          {ch.kind !== "single" &&
+            (() => {
+              const files = getFileStatuses();
+              return (
+                <div
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 8,
+                    marginTop: 14,
+                  }}
+                >
+                  {files.map((f) => (
                     <div
-                      style={{ display: "flex", alignItems: "center", gap: 8 }}
+                      key={f.key}
+                      style={{
+                        background: C.bg0,
+                        borderRadius: 8,
+                        border: `1px solid ${f.ok ? C.greenBorder : f.fb ? "rgba(248,113,113,0.2)" : C.border}`,
+                        padding: "10px 13px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                      }}
                     >
                       <div
                         style={{
-                          width: 7,
-                          height: 7,
-                          borderRadius: "50%",
-                          background: dotColor,
-                        }}
-                      />
-                      <span
-                        style={{
-                          fontSize: 12,
-                          color: C.text1,
-                          fontFamily: mono,
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
                         }}
                       >
-                        {label}
+                        <div
+                          style={{
+                            width: 7,
+                            height: 7,
+                            borderRadius: "50%",
+                            background: f.dot,
+                          }}
+                        />
+                        <span
+                          style={{
+                            fontSize: 12,
+                            color: C.text1,
+                            fontFamily: mono,
+                          }}
+                        >
+                          {f.label}
+                        </span>
+                      </div>
+                      <span
+                        style={{
+                          fontSize: 10,
+                          fontWeight: 700,
+                          letterSpacing: ".05em",
+                          padding: "2px 8px",
+                          borderRadius: 4,
+                          color: f.ok ? C.green : f.fb ? C.red : C.text3,
+                          background: f.ok
+                            ? C.greenDim
+                            : f.fb
+                              ? C.redDim
+                              : C.bg3,
+                        }}
+                      >
+                        {f.ok ? "fixed" : f.fb ? "needs fix" : "pending"}
                       </span>
                     </div>
-                    <span
-                      style={{
-                        fontSize: 10,
-                        fontWeight: 700,
-                        letterSpacing: ".05em",
-                        padding: "2px 8px",
-                        borderRadius: 4,
-                        color: ok ? C.green : fb ? C.red : C.text3,
-                        background: ok ? C.greenDim : fb ? C.redDim : C.bg3,
-                      }}
-                    >
-                      {status}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-          )}
+                  ))}
+                </div>
+              );
+            })()}
         </div>
 
-        {/* Divider */}
         <div style={{ height: 1, background: C.border, margin: "18px 0 0" }} />
 
-        {/* Scrollable bottom */}
         <div style={{ flex: 1, overflowY: "auto", padding: "16px 20px" }}>
-          {/* Success card */}
           {isPassed && (
             <div
               style={{
@@ -1451,14 +2261,16 @@ export default function DefensePage() {
               <div style={{ fontSize: 12, color: "#86efac", lineHeight: 1.6 }}>
                 {challengeType ? TYPE_LABELS[challengeType] : ""} attacks
                 halted.
-                {challengeType === "sqli" && " Login page is now protected."}
+                {challengeType === "sqli_login" &&
+                  " Login page is now protected."}
+                {challengeType === "sqli_search" &&
+                  " Search endpoint is now protected against UNION dumps."}
                 {challengeType === "jwt_forge" &&
-                  " Profile page blocks forge attempts."}
+                  " Token forgery and IDOR on /api/user are blocked."}
               </div>
             </div>
           )}
 
-          {/* Effects */}
           <div
             style={{
               fontSize: 10,
@@ -1475,20 +2287,28 @@ export default function DefensePage() {
               icon: "🛡",
               text: (
                 <>
-                  All{" "}
+                  {`All `}
                   <strong style={{ color: C.text1 }}>
                     {challengeType ? TYPE_LABELS[challengeType] : ""}
-                  </strong>{" "}
-                  logs marked fixed
+                  </strong>
+                  {` logs marked fixed`}
                 </>
               ),
             },
             { icon: "⛔", text: "New attacks of this type stop spawning" },
-            ...(challengeType === "sqli"
+            ...(challengeType === "sqli_login"
               ? [
                   {
                     icon: "🔒",
                     text: "Login page activates its patch banner live",
+                  },
+                ]
+              : []),
+            ...(challengeType === "sqli_search"
+              ? [
+                  {
+                    icon: "🔍",
+                    text: "Search page blocks UNION dump payloads live",
                   },
                 ]
               : []),
@@ -1504,8 +2324,8 @@ export default function DefensePage() {
               icon: "⭐",
               text: (
                 <>
-                  <strong style={{ color: C.green }}>+{ch.points} pts</strong>{" "}
-                  added to your score
+                  <strong style={{ color: C.green }}>+{ch.points} pts</strong>
+                  {` added to your score`}
                 </>
               ),
             },
@@ -1547,7 +2367,6 @@ export default function DefensePage() {
             </div>
           ))}
 
-          {/* Challenge board */}
           <div style={{ marginTop: 20 }}>
             <div
               style={{
@@ -1626,18 +2445,73 @@ export default function DefensePage() {
     );
   }
 
-  // ─── Two-file SQLi modal ──────────────────────────────────────────────────
-  // ─── Two-file SQLi modal ──────────────────────────────────────────────────
-  // ─── Two-file SQLi modal ──────────────────────────────────────────────────
-  function renderSqliModal(ch: TwoFileSqliChallenge) {
-    const activeHints =
-      sqliActiveTab === "route"
-        ? ch.routeHints
-        : sqliActiveTab === "page"
-          ? ch.pageHints
-          : [];
-    const activeRouteFeedback = sqliRouteFeedback && sqliActiveTab === "route";
-    const activePageFeedback = sqliPageFeedback && sqliActiveTab === "page";
+  // ─── Generic two-file modal renderer ─────────────────────────────────────
+  function renderTwoFileModal({
+    ch,
+    attackLabel,
+    attackColor,
+    attackBg,
+    attackBorder,
+    tab,
+    setTab,
+    file1Label,
+    file2Label,
+    file1Ok,
+    file2Ok,
+    file1Fb,
+    file2Fb,
+    code1,
+    code2,
+    setCode1,
+    setCode2,
+    showHintState,
+    setShowHintState,
+    activeHints,
+    activeFb,
+    activeOk,
+    bothPass,
+    submitFn,
+    renderDiffFn,
+    tabOptions,
+  }: {
+    ch: Challenge;
+    attackLabel: string;
+    attackColor: string;
+    attackBg: string;
+    attackBorder: string;
+    tab: string;
+    setTab: (t: any) => void;
+    file1Label: string;
+    file2Label: string;
+    file1Ok: boolean;
+    file2Ok: boolean;
+    file1Fb: string;
+    file2Fb: string;
+    code1: string;
+    code2: string;
+    setCode1: (v: string) => void;
+    setCode2: (v: string) => void;
+    showHintState: boolean;
+    setShowHintState: (v: boolean) => void;
+    activeHints: string[];
+    activeFb: string;
+    activeOk: boolean;
+    bothPass: boolean;
+    submitFn: () => void;
+    renderDiffFn: () => React.ReactNode;
+    tabOptions: string[];
+  }) {
+    const tabLabels: Record<string, string> = {
+      route: file1Label,
+      page: file2Label,
+      auth: file1Label,
+      diff: "Diff View",
+    };
+    const tabStatusMap: Record<string, boolean | null> = {
+      [tabOptions[0]]: file1Ok ? true : file1Fb ? false : null,
+      [tabOptions[1]]: file2Ok ? true : file2Fb ? false : null,
+      diff: null,
+    };
 
     return (
       <div
@@ -1646,7 +2520,7 @@ export default function DefensePage() {
           maxWidth: 1100,
           background: C.bg1,
           border: `1px solid ${C.border}`,
-          boxShadow: "0 25px 50px -12px rgba(0, 0, 0, 0.5)",
+          boxShadow: "0 25px 50px -12px rgba(0,0,0,0.5)",
           borderRadius: 12,
           display: "flex",
           flexDirection: "column",
@@ -1654,7 +2528,7 @@ export default function DefensePage() {
           overflow: "hidden",
         }}
       >
-        {/* Header - Clean SaaS Style */}
+        {/* Header */}
         <div
           style={{
             padding: "24px 32px",
@@ -1696,12 +2570,12 @@ export default function DefensePage() {
                   fontWeight: 600,
                   padding: "4px 10px",
                   borderRadius: 6,
-                  color: C.red,
-                  background: C.redDim,
-                  border: `1px solid rgba(239,68,68,0.2)`,
+                  color: attackColor,
+                  background: attackBg,
+                  border: `1px solid ${attackBorder}`,
                 }}
               >
-                SQL Injection
+                {attackLabel}
               </span>
             </div>
             <div
@@ -1726,7 +2600,6 @@ export default function DefensePage() {
               {ch.description}
             </div>
           </div>
-
           <div
             style={{
               display: "flex",
@@ -1780,15 +2653,6 @@ export default function DefensePage() {
                 cursor: "pointer",
                 fontSize: 13,
                 fontWeight: 500,
-                transition: "all 0.15s",
-              }}
-              onMouseOver={(e) => {
-                e.currentTarget.style.background = C.bg2;
-                e.currentTarget.style.color = C.text0;
-              }}
-              onMouseOut={(e) => {
-                e.currentTarget.style.background = "transparent";
-                e.currentTarget.style.color = C.text1;
               }}
             >
               Cancel
@@ -1798,7 +2662,6 @@ export default function DefensePage() {
 
         {/* Body */}
         <div style={{ display: "flex", flex: 1, minHeight: 0, height: 600 }}>
-          {/* Editor area */}
           <div
             style={{
               flex: 1,
@@ -1808,7 +2671,7 @@ export default function DefensePage() {
               background: C.bg0,
             }}
           >
-            {/* File tabs - Minimal Underline style */}
+            {/* Tabs */}
             <div
               style={{
                 display: "flex",
@@ -1817,24 +2680,13 @@ export default function DefensePage() {
                 padding: "0 16px",
               }}
             >
-              {(["route", "page", "diff"] as SqliFileTab[]).map((tab) => {
-                const labels: Record<SqliFileTab, string> = {
-                  route: "api/login/route.ts",
-                  page: "login/page.tsx",
-                  diff: "Diff View",
-                };
-                const statusMap: Record<SqliFileTab, boolean | null> = {
-                  route: sqliRouteOk ? true : sqliRouteFeedback ? false : null,
-                  page: sqliPageOk ? true : sqliPageFeedback ? false : null,
-                  diff: null,
-                };
-                const st = statusMap[tab];
-                const active = sqliActiveTab === tab;
-
+              {[...tabOptions, "diff"].map((t) => {
+                const st = tabStatusMap[t];
+                const active = tab === t;
                 return (
                   <button
-                    key={tab}
-                    onClick={() => setSqliActiveTab(tab)}
+                    key={t}
+                    onClick={() => setTab(t)}
                     style={{
                       fontFamily: sans,
                       background: "transparent",
@@ -1852,7 +2704,7 @@ export default function DefensePage() {
                       transform: "translateY(1px)",
                     }}
                   >
-                    {labels[tab]}
+                    {tabLabels[t] || t}
                     {st === true && (
                       <span style={{ fontSize: 12, color: C.green }}>✓</span>
                     )}
@@ -1864,8 +2716,7 @@ export default function DefensePage() {
               })}
             </div>
 
-            {/* Toolbar */}
-            {sqliActiveTab !== "diff" && (
+            {tab !== "diff" && (
               <div
                 style={{
                   padding: "12px 24px",
@@ -1877,66 +2728,51 @@ export default function DefensePage() {
                 }}
               >
                 <button
-                  onClick={() => setSqliShowHint((h) => !h)}
+                  onClick={() => setShowHintState(!showHintState)}
                   style={{
                     fontFamily: sans,
-                    background: sqliShowHint ? C.bg2 : "transparent",
-                    border: `1px solid ${sqliShowHint ? C.border2 : C.border}`,
+                    background: showHintState ? C.bg2 : "transparent",
+                    border: `1px solid ${showHintState ? C.border2 : C.border}`,
                     borderRadius: 6,
                     padding: "6px 12px",
-                    color: sqliShowHint ? C.text0 : C.text2,
+                    color: showHintState ? C.text0 : C.text2,
                     cursor: "pointer",
                     fontSize: 12,
                     fontWeight: 500,
                   }}
                 >
-                  {sqliShowHint ? "Hide hint" : "Show hint"}
+                  {showHintState ? "Hide hint" : "Show hint"}
                 </button>
               </div>
             )}
 
-            {/* Hint panel */}
-            {sqliActiveTab !== "diff" &&
-              sqliShowHint &&
-              renderHints(activeHints)}
+            {tab !== "diff" && showHintState && renderHints(activeHints)}
 
-            {/* Per-file feedback stripe */}
-            {(activeRouteFeedback || activePageFeedback) &&
-              (() => {
-                const ok = sqliActiveTab === "route" ? sqliRouteOk : sqliPageOk;
-                const fb =
-                  sqliActiveTab === "route"
-                    ? sqliRouteFeedback
-                    : sqliPageFeedback;
-                return (
-                  <div
-                    style={{
-                      padding: "12px 24px",
-                      fontSize: 13,
-                      fontWeight: 500,
-                      borderBottom: `1px solid ${ok ? C.greenBorder : "rgba(239,68,68,0.2)"}`,
-                      color: ok ? C.green : C.red,
-                      background: ok ? C.greenDim : C.redDim,
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 10,
-                    }}
-                  >
-                    {fb}
-                  </div>
-                );
-              })()}
+            {activeFb && tab !== "diff" && (
+              <div
+                style={{
+                  padding: "12px 24px",
+                  fontSize: 13,
+                  fontWeight: 500,
+                  borderBottom: `1px solid ${activeOk ? C.greenBorder : "rgba(239,68,68,0.2)"}`,
+                  color: activeOk ? C.green : C.red,
+                  background: activeOk ? C.greenDim : C.redDim,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                }}
+              >
+                {activeFb}
+              </div>
+            )}
 
-            {/* Textareas */}
-            {sqliActiveTab === "route" && (
+            {tab === tabOptions[0] && (
               <textarea
-                value={sqliRouteCode}
+                value={code1}
                 onChange={(e) => {
-                  setSqliRouteCode(e.target.value);
+                  setCode1(e.target.value);
                   if (challengeResult !== "pass") {
                     setChallengeResult("idle");
-                    setSqliRouteFeedback("");
-                    setSqliRouteOk(false);
                   }
                 }}
                 spellCheck={false}
@@ -1955,15 +2791,13 @@ export default function DefensePage() {
                 }}
               />
             )}
-            {sqliActiveTab === "page" && (
+            {tab === tabOptions[1] && (
               <textarea
-                value={sqliPageCode}
+                value={code2}
                 onChange={(e) => {
-                  setSqliPageCode(e.target.value);
+                  setCode2(e.target.value);
                   if (challengeResult !== "pass") {
                     setChallengeResult("idle");
-                    setSqliPageFeedback("");
-                    setSqliPageOk(false);
                   }
                 }}
                 spellCheck={false}
@@ -1982,10 +2816,9 @@ export default function DefensePage() {
                 }}
               />
             )}
-            {sqliActiveTab === "diff" && renderSqliDiff(ch)}
+            {tab === "diff" && renderDiffFn()}
           </div>
-
-          {renderRightPane(ch, true)}
+          {renderRightPane(ch, submitFn, bothPass)}
         </div>
       </div>
     );
@@ -1993,6 +2826,7 @@ export default function DefensePage() {
 
   // ─── Single-snippet modal ─────────────────────────────────────────────────
   function renderSingleModal(ch: SingleSnippetChallenge) {
+    const singlePass = challengeResult === "pass";
     return (
       <div
         style={{
@@ -2008,7 +2842,6 @@ export default function DefensePage() {
           boxShadow: "0 40px 80px rgba(0,0,0,0.7)",
         }}
       >
-        {/* Header */}
         <div
           style={{
             padding: "22px 28px",
@@ -2143,7 +2976,6 @@ export default function DefensePage() {
           </div>
         </div>
 
-        {/* Body */}
         <div style={{ display: "flex", flex: 1, minHeight: 0, height: 560 }}>
           <div
             style={{
@@ -2154,7 +2986,6 @@ export default function DefensePage() {
               background: C.bg0,
             }}
           >
-            {/* Toolbar */}
             <div
               style={{
                 padding: "10px 20px",
@@ -2196,11 +3027,7 @@ export default function DefensePage() {
                 hotfix.ts
               </span>
             </div>
-
-            {/* Hint panel */}
             {showHint && renderHints(ch.hints)}
-
-            {/* Editor label */}
             <div
               style={{
                 padding: "10px 20px 0",
@@ -2230,11 +3057,7 @@ export default function DefensePage() {
                   YOUR FIX
                 </span>
               </div>
-              <span style={{ fontSize: 10, color: C.text3, fontFamily: mono }}>
-                hotfix.ts
-              </span>
             </div>
-
             <textarea
               value={challengeCode}
               onChange={(e) => {
@@ -2261,11 +3084,154 @@ export default function DefensePage() {
               }}
             />
           </div>
-
-          {renderRightPane(ch, false)}
+          {renderRightPane(ch, submitChallenge, singlePass)}
         </div>
       </div>
     );
+  }
+
+  // ─── Challenge modal dispatcher ───────────────────────────────────────────
+  function renderChallengeModal() {
+    if (!challenge || !challengeType) return null;
+
+    if (challenge.kind === "two-file-sqli-login") {
+      const ch = challenge as TwoFileSqliLoginChallenge;
+      const activeHints =
+        sqliLoginActiveTab === "route"
+          ? ch.routeHints
+          : sqliLoginActiveTab === "page"
+            ? ch.pageHints
+            : [];
+      const activeFb =
+        sqliLoginActiveTab === "route"
+          ? sqliLoginRouteFeedback
+          : sqliLoginActiveTab === "page"
+            ? sqliLoginPageFeedback
+            : "";
+      const activeOk =
+        sqliLoginActiveTab === "route" ? sqliLoginRouteOk : sqliLoginPageOk;
+      return renderTwoFileModal({
+        ch,
+        attackLabel: "SQL Injection — Login",
+        attackColor: "#b91c1c",
+        attackBg: "#fff1f1",
+        attackBorder: "#fca5a5",
+        tab: sqliLoginActiveTab,
+        setTab: setSqliLoginActiveTab,
+        file1Label: "api/login/route.ts",
+        file2Label: "login/page.tsx",
+        file1Ok: sqliLoginRouteOk,
+        file2Ok: sqliLoginPageOk,
+        file1Fb: sqliLoginRouteFeedback,
+        file2Fb: sqliLoginPageFeedback,
+        code1: sqliLoginRouteCode,
+        code2: sqliLoginPageCode,
+        setCode1: setSqliLoginRouteCode,
+        setCode2: setSqliLoginPageCode,
+        showHintState: sqliLoginShowHint,
+        setShowHintState: setSqliLoginShowHint,
+        activeHints,
+        activeFb,
+        activeOk,
+        bothPass: sqliLoginRouteOk && sqliLoginPageOk,
+        submitFn: submitSqliLoginChallenge,
+        renderDiffFn: () => renderSqliLoginDiff(ch),
+        tabOptions: ["route", "page"],
+      });
+    }
+
+    if (challenge.kind === "two-file-sqli-search") {
+      const ch = challenge as TwoFileSqliSearchChallenge;
+      const activeHints =
+        sqliSearchActiveTab === "route"
+          ? ch.routeHints
+          : sqliSearchActiveTab === "page"
+            ? ch.pageHints
+            : [];
+      const activeFb =
+        sqliSearchActiveTab === "route"
+          ? sqliSearchRouteFeedback
+          : sqliSearchActiveTab === "page"
+            ? sqliSearchPageFeedback
+            : "";
+      const activeOk =
+        sqliSearchActiveTab === "route" ? sqliSearchRouteOk : sqliSearchPageOk;
+      return renderTwoFileModal({
+        ch,
+        attackLabel: "SQL Injection — Search",
+        attackColor: "#be185d",
+        attackBg: "#fdf2f8",
+        attackBorder: "#f9a8d4",
+        tab: sqliSearchActiveTab,
+        setTab: setSqliSearchActiveTab,
+        file1Label: "api/search/route.ts",
+        file2Label: "search/page.tsx",
+        file1Ok: sqliSearchRouteOk,
+        file2Ok: sqliSearchPageOk,
+        file1Fb: sqliSearchRouteFeedback,
+        file2Fb: sqliSearchPageFeedback,
+        code1: sqliSearchRouteCode,
+        code2: sqliSearchPageCode,
+        setCode1: setSqliSearchRouteCode,
+        setCode2: setSqliSearchPageCode,
+        showHintState: sqliSearchShowHint,
+        setShowHintState: setSqliSearchShowHint,
+        activeHints,
+        activeFb,
+        activeOk,
+        bothPass: sqliSearchRouteOk && sqliSearchPageOk,
+        submitFn: submitSqliSearchChallenge,
+        renderDiffFn: () => renderSqliSearchDiff(ch),
+        tabOptions: ["route", "page"],
+      });
+    }
+
+    if (challenge.kind === "two-file-jwt") {
+      const ch = challenge as TwoFileJwtChallenge;
+      const activeHints =
+        jwtActiveTab === "auth"
+          ? ch.authHints
+          : jwtActiveTab === "route"
+            ? ch.routeHints
+            : [];
+      const activeFb =
+        jwtActiveTab === "auth"
+          ? jwtAuthFeedback
+          : jwtActiveTab === "route"
+            ? jwtRouteFeedback
+            : "";
+      const activeOk = jwtActiveTab === "auth" ? jwtAuthOk : jwtRouteOk;
+      return renderTwoFileModal({
+        ch,
+        attackLabel: "JWT Forgery",
+        attackColor: "#7c3aed",
+        attackBg: "#f5f3ff",
+        attackBorder: "#c4b5fd",
+        tab: jwtActiveTab,
+        setTab: setJwtActiveTab,
+        file1Label: "lib/auth.ts",
+        file2Label: "api/user/route.ts",
+        file1Ok: jwtAuthOk,
+        file2Ok: jwtRouteOk,
+        file1Fb: jwtAuthFeedback,
+        file2Fb: jwtRouteFeedback,
+        code1: jwtAuthCode,
+        code2: jwtRouteCode,
+        setCode1: setJwtAuthCode,
+        setCode2: setJwtRouteCode,
+        showHintState: jwtShowHint,
+        setShowHintState: setJwtShowHint,
+        activeHints,
+        activeFb,
+        activeOk,
+        bothPass: jwtAuthOk && jwtRouteOk,
+        submitFn: submitJwtChallenge,
+        renderDiffFn: () => renderJwtDiff(ch),
+        tabOptions: ["auth", "route"],
+      });
+    }
+
+    return renderSingleModal(challenge as SingleSnippetChallenge);
   }
 
   // ─── JSX ─────────────────────────────────────────────────────────────────
@@ -2309,9 +3275,7 @@ export default function DefensePage() {
             padding: 20,
           }}
         >
-          {challenge.kind === "two-file"
-            ? renderSqliModal(challenge as TwoFileSqliChallenge)
-            : renderSingleModal(challenge as SingleSnippetChallenge)}
+          {renderChallengeModal()}
         </div>
       )}
 
@@ -2547,7 +3511,6 @@ export default function DefensePage() {
             minWidth: 0,
           }}
         >
-          {/* Filter tabs */}
           <div
             style={{
               display: "flex",
@@ -2632,11 +3595,10 @@ export default function DefensePage() {
             </span>
           </div>
 
-          {/* Column headers */}
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "88px 82px 130px 1fr 110px",
+              gridTemplateColumns: "88px 82px 150px 1fr 110px",
               padding: "9px 24px",
               background: "#0d0d10",
               borderBottom: "1px solid #1e1e24",
@@ -2654,7 +3616,6 @@ export default function DefensePage() {
             <span style={{ textAlign: "right" }}>STATUS</span>
           </div>
 
-          {/* Log rows */}
           <div style={{ flex: 1, overflowY: "auto" }}>
             {filteredLogs.length === 0 && (
               <div
@@ -2695,7 +3656,7 @@ export default function DefensePage() {
                   onClick={() => setSelected(isSel ? null : log.id)}
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "88px 82px 130px 1fr 110px",
+                    gridTemplateColumns: "88px 82px 150px 1fr 110px",
                     alignItems: "center",
                     padding: "11px 24px",
                     borderBottom: "1px solid #16161a",
@@ -2938,7 +3899,6 @@ export default function DefensePage() {
                       gap: 16,
                     }}
                   >
-                    {/* Threat card */}
                     <div
                       style={{
                         background: "#16161a",
@@ -3100,7 +4060,6 @@ export default function DefensePage() {
                       </div>
                     </div>
 
-                    {/* Action area */}
                     {isGP ? (
                       <div
                         style={{
@@ -3153,7 +4112,6 @@ export default function DefensePage() {
                           gap: 8,
                         }}
                       >
-                        {/* Step indicator */}
                         <div
                           style={{
                             display: "flex",
@@ -3313,19 +4271,6 @@ export default function DefensePage() {
                               </div>
                             </div>
                           </div>
-                          {!selectedLog.detected && (
-                            <span
-                              style={{
-                                fontSize: 10,
-                                color: "#1a6080",
-                                background: "rgba(56,189,248,.08)",
-                                padding: "2px 7px",
-                                borderRadius: 4,
-                              }}
-                            >
-                              No pts
-                            </span>
-                          )}
                         </button>
                         <button
                           onClick={() => openPatch(selectedLog.id)}
@@ -3566,19 +4511,15 @@ export default function DefensePage() {
 
       <style jsx global>{`
         @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap");
-
         * {
           box-sizing: border-box;
         }
-
         body {
           margin: 0;
           background: #09090b;
           font-family: "Inter", system-ui, sans-serif;
           -webkit-font-smoothing: antialiased;
         }
-
-        /* Minimal Scrollbar */
         ::-webkit-scrollbar {
           width: 6px;
           height: 6px;
@@ -3593,7 +4534,6 @@ export default function DefensePage() {
         ::-webkit-scrollbar-thumb:hover {
           background: #52525b;
         }
-
         textarea:focus,
         button:focus {
           outline: none;
@@ -3604,7 +4544,127 @@ export default function DefensePage() {
         textarea::selection {
           background: rgba(59, 130, 246, 0.2);
         }
+        @keyframes pulse {
+          0%,
+          100% {
+            opacity: 1;
+          }
+          50% {
+            opacity: 0.4;
+          }
+        }
+        @keyframes fadeup {
+          from {
+            opacity: 0;
+            transform: translateY(4px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+        @keyframes redflash {
+          0% {
+            opacity: 1;
+          }
+          100% {
+            opacity: 0;
+          }
+        }
       `}</style>
+    </div>
+  );
+}
+
+// ─── Pure helper components to keep render fns clean ─────────────────────────
+function DiffHeader({
+  label,
+  color,
+  top = false,
+}: {
+  label: string;
+  color: string;
+  top?: boolean;
+}) {
+  return (
+    <div
+      style={{
+        padding: "10px 20px",
+        fontSize: 10,
+        fontWeight: 700,
+        letterSpacing: ".1em",
+        color,
+        borderBottom: `1px solid ${color}26`,
+        ...(top ? { borderTop: `1px solid ${color}26`, marginTop: 12 } : {}),
+        background: `${color}0a`,
+      }}
+    >
+      {label}
+    </div>
+  );
+}
+
+function DiffLine({
+  line,
+  num,
+  bad,
+}: {
+  line: string;
+  num: number;
+  bad: boolean;
+}) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "44px 1fr" }}>
+      <span
+        style={{
+          color: "#52525b",
+          padding: "0 12px",
+          textAlign: "right",
+          userSelect: "none",
+          fontSize: 11,
+        }}
+      >
+        {num}
+      </span>
+      <span
+        style={{
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-all",
+          paddingRight: 20,
+          background: bad ? "rgba(248,113,113,0.13)" : "transparent",
+          color: bad ? "#fca5a5" : "#71717a",
+        }}
+      >
+        {line || " "}
+      </span>
+    </div>
+  );
+}
+
+function DiffFixLine({ line }: { line: string }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "44px 1fr" }}>
+      <span
+        style={{
+          color: "#10b981",
+          padding: "0 12px",
+          textAlign: "right",
+          opacity: 0.5,
+          fontSize: 11,
+        }}
+      >
+        +
+      </span>
+      <span
+        style={{
+          whiteSpace: "pre-wrap",
+          color: "#86efac",
+          background: "rgba(74,222,128,0.08)",
+          paddingRight: 20,
+        }}
+      >
+        {line || " "}
+      </span>
     </div>
   );
 }
