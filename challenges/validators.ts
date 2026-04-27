@@ -478,3 +478,51 @@ export function validateXssTxn(code: string): ValidationResult {
       "❌ Render t.description as a safe JSX text node: {t.description}",
   };
 }
+
+// ── Open Redirect ─────────────────────────────────────────────────────────────
+
+export function validateOpenRedirectRoute(code: string): ValidationResult {
+  if (!/ALLOWED_PATHS|allowList|allowedPaths|whitelist/i.test(code))
+    return { pass: false, feedback: "❌ Define an ALLOWED_PATHS allowlist of safe internal paths." };
+  if (!/ALLOWED_PATHS\.includes|allowList\.includes|allowedPaths\.includes/i.test(code))
+    return { pass: false, feedback: "❌ Check if the destination is in ALLOWED_PATHS before redirecting." };
+  if (!/404|403|400|Forbidden|Bad Request|Invalid/i.test(code))
+    return { pass: false, feedback: "❌ Return an error response (400/403) when the redirect destination is not allowed." };
+  return { pass: true, feedback: "✅ Route fixed! Redirect now validates against an allowlist." };
+}
+
+export function validateOpenRedirectPage(code: string): ValidationResult {
+  if (!/ALLOWED_PATHS|allowList|allowedPaths/i.test(code))
+    return { pass: false, feedback: "❌ Define an ALLOWED_PATHS allowlist in the page component too." };
+  if (!/isPatched\s*&&|&&\s*isPatched/.test(code))
+    return { pass: false, feedback: "❌ Add an if (isPatched && ...) guard that blocks external redirects." };
+  if (!/blocked|setStatus.*blocked|show.*blocked/i.test(code))
+    return { pass: false, feedback: "❌ Show a 'Blocked' UI state instead of redirecting when the patch is active." };
+  return { pass: true, feedback: "✅ Page fixed! External redirects are blocked when the patch is active." };
+}
+
+// ── XSS Profile Bio ───────────────────────────────────────────────────────────
+
+export function validateXssProfile(code: string): ValidationResult {
+  if (/dangerouslySetInnerHTML/.test(code))
+    return { pass: false, feedback: "❌ dangerouslySetInnerHTML is still present — remove it entirely." };
+  if (!/\{bio\}|\{\s*bio\s*\}/.test(code))
+    return { pass: false, feedback: "❌ Render bio as a JSX text node: {bio}. Don't use __html." };
+  return { pass: true, feedback: "✅ Correct! React auto-escapes {bio}, preventing XSS execution." };
+}
+
+// ── Mass Assignment ───────────────────────────────────────────────────────────
+
+export function validateMassAssignment(code: string): ValidationResult {
+  if (/Object\.keys\(body\)/.test(code) && !/ALLOWED_FIELDS|allowedFields|whitelist/i.test(code))
+    return { pass: false, feedback: "❌ Still using Object.keys(body) with no field filtering — add an allowlist." };
+  if (!/ALLOWED_FIELDS|allowedFields|whitelist/i.test(code))
+    return { pass: false, feedback: "❌ Define an ALLOWED_FIELDS allowlist (e.g. [\"username\", \"email\", \"bio\"]) to filter the body." };
+  if (!/filter|includes/.test(code))
+    return { pass: false, feedback: "❌ Filter body keys against the allowlist — only permitted fields should reach the SQL query." };
+  if (/role.*=.*body|balance.*=.*body|body.*role|body.*balance/.test(code.replace(/\s+/g, " ")))
+    return { pass: false, feedback: "❌ Still allowing role or balance to be passed from the body — they must be excluded." };
+  if (/debug.*updatedFields|updatedFields.*debug/.test(code.replace(/\s+/g, " ")))
+    return { pass: false, feedback: "❌ Remove the debug.updatedFields from the response — it leaks internal state." };
+  return { pass: true, feedback: "✅ Fixed! Only allowlisted fields reach the UPDATE query — role/balance are protected." };
+}

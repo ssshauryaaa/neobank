@@ -64,49 +64,61 @@ export const SEV_CONFIG: Record<
 
 // ── Attack type labels & colors ───────────────────────────────────────────────
 export const TYPE_LABELS: Record<AttackType, string> = {
-  jwt_forge: "JWT FORGERY",
-  sqli_login: "SQLI — LOGIN",
-  sqli_search: "SQLI — SEARCH",
-  idor: "IDOR ATTACK",
-  xss: "XSS INJECTION",
-  sqli_txn: "SQLI — TRANSACTIONS",
-  sqli_txn_insert: "SQLI — TXN INSERT",
-  xss_txn: "XSS — TRANSACTIONS",
+  jwt_forge:        "JWT FORGERY",
+  sqli_login:       "SQLI — LOGIN",
+  sqli_search:      "SQLI — SEARCH",
+  idor:             "IDOR ATTACK",
+  xss:              "XSS INJECTION",
+  sqli_txn:         "SQLI — TRANSACTIONS",
+  sqli_txn_insert:  "SQLI — TXN INSERT",
+  xss_txn:          "XSS — TRANSACTIONS",
+  open_redirect:    "OPEN REDIRECT",
+  xss_profile:      "XSS — PROFILE BIO",
+  mass_assignment:  "MASS ASSIGNMENT",
 };
 
 export const TYPE_COLORS: Record<
   AttackType,
   { text: string; bg: string; border: string }
 > = {
-  jwt_forge: { text: "#7c3aed", bg: "#f5f3ff", border: "#c4b5fd" },
-  sqli_login: { text: "#b91c1c", bg: "#fff1f1", border: "#fca5a5" },
-  sqli_search: { text: "#be185d", bg: "#fdf2f8", border: "#f9a8d4" },
-  idor: { text: "#0369a1", bg: "#eff6ff", border: "#bae6fd" },
-  xss: { text: "#c2410c", bg: "#fff7ed", border: "#fed7aa" },
-  sqli_txn: { text: "#9a3412", bg: "#fff7ed", border: "#fb923c" },
-  sqli_txn_insert: { text: "#7c2d12", bg: "#fef3c7", border: "#fbbf24" },
-  xss_txn: { text: "#065f46", bg: "#ecfdf5", border: "#6ee7b7" },
+  jwt_forge:        { text: "#7c3aed", bg: "#f5f3ff", border: "#c4b5fd" },
+  sqli_login:       { text: "#b91c1c", bg: "#fff1f1", border: "#fca5a5" },
+  sqli_search:      { text: "#be185d", bg: "#fdf2f8", border: "#f9a8d4" },
+  idor:             { text: "#0369a1", bg: "#eff6ff", border: "#bae6fd" },
+  xss:              { text: "#c2410c", bg: "#fff7ed", border: "#fed7aa" },
+  sqli_txn:         { text: "#9a3412", bg: "#fff7ed", border: "#fb923c" },
+  sqli_txn_insert:  { text: "#7c2d12", bg: "#fef3c7", border: "#fbbf24" },
+  xss_txn:          { text: "#065f46", bg: "#ecfdf5", border: "#6ee7b7" },
+  open_redirect:    { text: "#1d4ed8", bg: "#eff6ff", border: "#93c5fd" },
+  xss_profile:      { text: "#9d174d", bg: "#fdf2f8", border: "#fbcfe8" },
+  mass_assignment:  { text: "#6b21a8", bg: "#faf5ff", border: "#d8b4fe" },
 };
 
 // ── Patch key mapping ─────────────────────────────────────────────────────────
 export const PATCH_KEYS: Record<string, string> = {
-  sqli_login: "patched_sqli",
-  sqli_search: "patched_sqli_search",
-  jwt_forge: "patched_jwt",
-  xss: "patched_xss",
-  idor: "patched_idor",
-  sqli_txn: "patched_sqli_txn",
-  sqli_txn_insert: "patched_sqli_txn_insert",
-  xss_txn: "patched_xss_txn", // ← NEW
+  sqli_login:       "patched_sqli",
+  sqli_search:      "patched_sqli_search",
+  jwt_forge:        "patched_jwt",
+  xss:              "patched_xss",
+  idor:             "patched_idor",
+  sqli_txn:         "patched_sqli_txn",
+  sqli_txn_insert:  "patched_sqli_txn_insert",
+  xss_txn:          "patched_xss_txn",
+  open_redirect:    "patched_open_redirect",
+  xss_profile:      "patched_xss_profile",
+  mass_assignment:  "patched_mass_assignment",
 };
 
 export const PATCH_TARGET_MAP: Partial<Record<string, string>> = {
-  sqli_login: "sqli_login",
-  sqli_search: "sqli_search",
-  jwt_forge: "jwt_forge",
-  xss: "xss",
-  idor: "idor",
-  sqli_txn: "sqli_txn",
-  sqli_txn_insert: "sqli_txn_insert",
-  xss_txn: "xss_txn", // ← NEW
+  sqli_login:       "sqli_login",
+  sqli_search:      "sqli_search",
+  jwt_forge:        "jwt_forge",
+  xss:              "xss",
+  idor:             "idor",
+  sqli_txn:         "sqli_txn",
+  sqli_txn_insert:  "sqli_txn_insert",
+  xss_txn:          "xss_txn",
+  open_redirect:    "open_redirect",
+  xss_profile:      "xss_profile",
+  mass_assignment:  "mass_assignment",
 };

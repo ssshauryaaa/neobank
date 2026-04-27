@@ -9,6 +9,10 @@ import {
   SQLI_TXN_ROUTE_STARTER,
   SQLI_TXN_INSERT_STARTER,
   XSS_TXN_PAGE_STARTER,
+  OPEN_REDIRECT_ROUTE_STARTER,
+  OPEN_REDIRECT_PAGE_STARTER,
+  XSS_PROFILE_PAGE_STARTER,
+  MASS_ASSIGNMENT_ROUTE_STARTER,
 } from "@/challenges/starterCode";
 import {
   validateSqliLoginRoute,
@@ -23,6 +27,10 @@ import {
   validateSqliTxnPage,
   validateSqliTxnInsert,
   validateXssTxn,
+  validateOpenRedirectRoute,
+  validateOpenRedirectPage,
+  validateXssProfile,
+  validateMassAssignment,
 } from "@/challenges/validators";
 
 export const CHALLENGES: Partial<Record<string, Challenge>> = {
@@ -330,4 +338,93 @@ export async function GET(req: NextRequest) {
     ],
     validate: validateXssTxn,
   },
+
+  // ── Open Redirect ──────────────────────────────────────────────────────────────
+
+  open_redirect: {
+    kind: "two-file",
+    title: "Fix Open Redirect — API route & redirect page",
+    description:
+      "The /api/redirect endpoint accepts any ?next= value and issues a 302 to it without validation. An attacker can craft a link like /redirect?next=https://evil.com that appears to come from neobank.com — a classic phishing vector. Fix the route to only allow allowlisted internal paths, and update the frontend to show a 'Blocked' state instead of redirecting.",
+    points: 100,
+    attackLabel: "Open Redirect",
+    attackColor: "#1d4ed8",
+    attackBg: "#eff6ff",
+    attackBorder: "#93c5fd",
+    tabs: ["route", "page"],
+    tabLabels: { route: "api/redirect/route.ts", page: "redirect/page.tsx" },
+    startCodes: {
+      route: OPEN_REDIRECT_ROUTE_STARTER,
+      page:  OPEN_REDIRECT_PAGE_STARTER,
+    },
+    hints: {
+      route: [
+        "Define a strict allowlist of safe internal paths:",
+        `const ALLOWED_PATHS = ["/dashboard", "/profile", "/transactions", "/settings", "/transfer"];`,
+        "Before redirecting, check if the destination is in the allowlist — return 400 otherwise:",
+        `if (!ALLOWED_PATHS.includes(next)) {\n  return NextResponse.json({ error: "Invalid redirect destination" }, { status: 400 });\n}`,
+      ],
+      page: [
+        "In the page component, add a guard that checks isPatched before redirecting:",
+        `if (isPatched && (isExternal || !ALLOWED_PATHS.includes(rawNext))) {\n  setStatus("blocked");\n  return;\n}`,
+        "Show a 'Redirect Blocked' UI state instead of counting down and redirecting.",
+      ],
+    },
+    validate: { route: validateOpenRedirectRoute, page: validateOpenRedirectPage },
+    diffVulnLines: {
+      route: /searchParams\.get.*next|NextResponse\.redirect.*next/,
+      page: /window\.location\.href.*rawNext|setTimeout.*rawNext/,
+    },
+    fixLines: {
+      route: [
+        `const ALLOWED_PATHS = ["/dashboard", "/profile", "/transactions", "/settings", "/transfer"];`,
+        `if (!ALLOWED_PATHS.includes(next)) {`,
+        `  return NextResponse.json({ error: "Invalid redirect destination" }, { status: 400 });`,
+        `}`,
+      ],
+      page: [
+        `if (isPatched && (isExternal || !ALLOWED_PATHS.includes(rawNext))) {`,
+        `  setStatus("blocked");`,
+        `  return;`,
+        `}`,
+      ],
+    },
+  },
+
+  // ── XSS — Profile Bio ─────────────────────────────────────────────────────────
+
+  xss_profile: {
+    kind: "single",
+    title: "Fix: Stored XSS via Profile Bio (dangerouslySetInnerHTML)",
+    description:
+      "The profile page renders a user-controlled \"bio\" field via dangerouslySetInnerHTML, which executes any HTML or JavaScript stored in it. An attacker can save a payload like <img src=x onerror=\"alert(document.cookie)\"> and have it execute every time any user views their profile. Fix it by rendering bio as a safe JSX text node.",
+    points: 90,
+    starterCode: XSS_PROFILE_PAGE_STARTER,
+    hints: [
+      "Find every dangerouslySetInnerHTML reference in the profile page and remove it entirely.",
+      "React automatically escapes text when rendered as a JSX expression — use {bio} instead of __html: bio",
+      `Replace the vulnerable div with a safe span:\n<span>{bio}</span>\n// React will render the literal text, not execute any HTML inside it.`,
+    ],
+    validate: validateXssProfile,
+  },
+
+  // ── Mass Assignment ────────────────────────────────────────────────────────────
+
+  mass_assignment: {
+    kind: "single",
+    title: "Fix: Mass Assignment in Profile Update API",
+    description:
+      "The PATCH /api/profile endpoint accepts any JSON body and applies all fields directly to a SQL UPDATE with no validation. An attacker can send {\"role\":\"admin\",\"balance\":999999} to escalate their privileges or credit themselves arbitrary funds. Fix it by implementing a strict field allowlist that only permits safe fields like username, email, and bio.",
+    points: 130,
+    starterCode: MASS_ASSIGNMENT_ROUTE_STARTER,
+    hints: [
+      "Define an explicit allowlist of fields that users are permitted to update:",
+      `const ALLOWED_FIELDS = ["username", "email", "bio"];`,
+      "Filter the request body against the allowlist before building the SQL query:",
+      `const safeFields = Object.keys(body).filter(f => ALLOWED_FIELDS.includes(f));\nif (safeFields.length === 0) return NextResponse.json({ success: false, message: "No valid fields" }, { status: 400 });`,
+      "Remove the debug.updatedFields from the response — it leaks internal SQL structure.",
+    ],
+    validate: validateMassAssignment,
+  },
 };
+

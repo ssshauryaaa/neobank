@@ -451,3 +451,130 @@ export const XSS_TXN_PAGE_STARTER = `// ✅ YOUR FIX — remove unsafe rendering
     </div>
   </div>
 ))}`;
+
+// ── Open Redirect — starter code ──────────────────────────────────────────────
+
+export const OPEN_REDIRECT_ROUTE_STARTER = `import { NextRequest, NextResponse } from "next/server";
+
+// 🔴 FIX THIS: accepts any value for \`next\` and redirects there with no validation
+// Exploit: /api/redirect?next=https://evil.com
+// An attacker can send a phishing link that appears to come from your domain.
+export async function GET(req: NextRequest) {
+  const { searchParams } = new URL(req.url);
+
+  // 🔴 FIX: validate \`next\` against an allowlist of safe internal paths
+  const next = searchParams.get("next") || "/dashboard";
+
+  // Returns a 302 redirect to ANY destination the attacker supplies
+  return NextResponse.redirect(next.startsWith("/") ? \`http://localhost:3000\${next}\` : next, {
+    status: 302,
+  });
+}`;
+
+export const OPEN_REDIRECT_PAGE_STARTER = `"use client";
+import { useState, useEffect, Suspense } from "react";
+import { useSearchParams } from "next/navigation";
+
+const PATCH_KEY = "patched_open_redirect";
+const ALLOWED_PATHS = ["/dashboard", "/profile", "/transactions", "/settings", "/transfer"];
+
+function RedirectPageInner() {
+  const searchParams = useSearchParams();
+  const rawNext = searchParams.get("next") || "/dashboard";
+  const [isPatched, setIsPatched] = useState(false);
+
+  useEffect(() => {
+    const check = () => setIsPatched(localStorage.getItem(PATCH_KEY) === "1");
+    check();
+    const iv = setInterval(check, 800);
+    return () => clearInterval(iv);
+  }, []);
+
+  const isExternal = /^https?:\\/\\//i.test(rawNext) || rawNext.startsWith("//");
+
+  // 🔴 FIX THIS: add allowlist validation before redirecting
+  // When isPatched is true, block any destination not in ALLOWED_PATHS
+  // Hint: if (isPatched && (isExternal || !ALLOWED_PATHS.includes(rawNext))) { show blocked state }
+
+  useEffect(() => {
+    // TODO: add allowlist check here when isPatched is true
+    // If not patched OR destination is safe, redirect after 3 seconds
+    const t = setTimeout(() => { window.location.href = rawNext; }, 3000);
+    return () => clearTimeout(t);
+  }, [rawNext]);
+
+  return (
+    <div>
+      {isExternal && !isPatched && (
+        <div>⚠ Vulnerability active: redirecting to external URL {rawNext}</div>
+      )}
+      {isExternal && isPatched && (
+        // This should be shown instead of redirecting
+        <div>✅ Patched: external redirect to {rawNext} blocked.</div>
+      )}
+      <p>Redirecting to: {rawNext}</p>
+    </div>
+  );
+}
+
+export default function RedirectPage() {
+  return (
+    <Suspense fallback={<div>Loading...</div>}>
+      <RedirectPageInner />
+    </Suspense>
+  );
+}`;
+
+// ── XSS Profile Bio — starter code ───────────────────────────────────────────
+
+export const XSS_PROFILE_PAGE_STARTER = `// ✅ YOUR FIX — replace dangerouslySetInnerHTML with safe JSX text rendering
+
+// Current vulnerable code renders the bio like this:
+//   <div dangerouslySetInnerHTML={{ __html: bio }} />
+//
+// This allows any HTML/JS stored in the bio field to execute in the browser.
+// Payload: <img src=x onerror="alert(document.cookie)">
+//
+// Fix it by rendering bio as a safe JSX text node:
+{bio ? (
+  <span>{bio}</span>        // ✅ React auto-escapes this — XSS is impossible
+) : (
+  <span>No bio set.</span>
+)}
+
+// Also remove any remaining dangerouslySetInnerHTML references from this component.`;
+
+// ── Mass Assignment — starter code ────────────────────────────────────────────
+
+export const MASS_ASSIGNMENT_ROUTE_STARTER = `import { NextRequest, NextResponse } from "next/server";
+import { getDb } from "../../../lib/db";
+import { getUserFromToken } from "../../../lib/auth";
+
+// 🔴 FIX THIS: PATCH /api/profile blindly applies ALL body fields to the DB
+// Exploit: send {"role":"admin","balance":999999} to escalate privileges
+export async function PATCH(req: NextRequest) {
+  const token = req.headers.get("Authorization")?.replace("Bearer ", "") ?? req.cookies.get("token")?.value;
+  if (!token) return NextResponse.json({ success: false, message: "Unauthorized" }, { status: 401 });
+
+  const decoded: any = getUserFromToken(token);
+  const body = await req.json();
+
+  // 🔴 FIX THIS: build SET clause from ALL fields — no whitelist applied
+  // An attacker can pass role:"admin" or balance:999999 to override protected fields
+  const fields = Object.keys(body);
+  const setClauses = fields.map((f) => \`\${f} = ?\`).join(", ");
+  const values = fields.map((f) => body[f]);
+
+  const db = await getDb();
+  await db.query(\`UPDATE users SET \${setClauses} WHERE id = ?\`, [...values, decoded.id]);
+
+  const [rows]: any = await db.query(
+    "SELECT id, username, email, role, balance FROM users WHERE id = ?",
+    [decoded.id]
+  );
+
+  return NextResponse.json({
+    success: true, message: "Profile updated", user: rows[0],
+    debug: { updatedFields: fields },   // 🔴 FIX: remove this debug info
+  });
+}`;

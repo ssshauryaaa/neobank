@@ -5,10 +5,39 @@ import { useRouter } from "next/navigation";
 import Sidebar from "../../components/Sidebar";
 import { useTheme } from "../../components/ThemeProvider";
 
-// ── Shared patch state key (same key the defense console writes to) ──────────
-// The defense console calls: localStorage.setItem('patched_jwt', '1')
-// This page reads it to show the "fixed" banner and block forge attempts.
-const PATCH_KEY = "patched_jwt";
+const PATCH_KEY     = "patched_jwt";
+const XSS_PATCH_KEY = "patched_xss_profile";
+
+function detectXssBio(val: string): boolean {
+  return (
+    /<script/i.test(val) ||
+    /onerror\s*=/i.test(val) ||
+    /onload\s*=/i.test(val) ||
+    /javascript:/i.test(val) ||
+    /<img[^>]+src/i.test(val) ||
+    /alert\s*\(/i.test(val) ||
+    /document\.cookie/i.test(val)
+  );
+}
+
+function pushXssAttack(payload: string, blocked: boolean) {
+  const entry = {
+    id: Math.random().toString(36).slice(2, 10).toUpperCase(),
+    ts: Date.now(), type: "xss_profile", severity: "high",
+    ip: "REAL ATTACKER", port: 443, user: "self",
+    detail: blocked
+      ? `✦ REAL ATTACK — Stored XSS in profile bio BLOCKED by safe rendering`
+      : `✦ REAL ATTACK — Stored XSS executed in profile bio: "${payload.slice(0, 60)}"`,
+    endpoint: "/profile", method: "GET", statusCode: 200,
+    userAgent: typeof navigator !== "undefined" ? navigator.userAgent.slice(0, 60) : "",
+    payload: `bio=${payload}`, country: "LIVE", patched: blocked, detected: true,
+  };
+  try {
+    const existing = JSON.parse(localStorage.getItem("real_attack_log") || "[]");
+    existing.unshift(entry);
+    localStorage.setItem("real_attack_log", JSON.stringify(existing.slice(0, 50)));
+  } catch { /* ignore */ }
+}
 
 function signJwt(payload: object, secret: string) {
   const encode = (obj: any) =>
@@ -50,6 +79,13 @@ export default function ProfilePage() {
   const [jwtFixed, setJwtFixed] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  // ── XSS Bio state ──────────────────────────────────────────────────────────
+  const [bio, setBio] = useState("");
+  const [editBio, setEditBio] = useState("");
+  const [isEditingBio, setIsEditingBio] = useState(false);
+  const [xssPatched, setXssPatched] = useState(false);
+  const [bioAttackLogged, setBioAttackLogged] = useState(false);
+
   const theme = {
     bgMain: isDark ? "#000000" : "#F9F8F6",
     textMain: isDark ? "#EDEDED" : "#1A1A1A",
@@ -67,15 +103,31 @@ export default function ProfilePage() {
     forgedBannerBorder: isDark ? "#422006" : "#F5D76E",
   };
 
-  // ── Poll localStorage for JWT patch status (set by the defense console)
   useEffect(() => {
     function check() {
       setJwtFixed(localStorage.getItem(PATCH_KEY) === "1");
+      setXssPatched(localStorage.getItem(XSS_PATCH_KEY) === "1");
     }
     check();
     const iv = setInterval(check, 800);
     return () => clearInterval(iv);
   }, []);
+
+  // Load stored bio
+  useEffect(() => {
+    const storedBio = localStorage.getItem("profile_bio") || "";
+    setBio(storedBio);
+    setEditBio(storedBio);
+  }, []);
+
+  // Log XSS attack when bio has payload and page is visible
+  useEffect(() => {
+    if (!bio || bioAttackLogged) return;
+    if (detectXssBio(bio)) {
+      pushXssAttack(bio, xssPatched);
+      setBioAttackLogged(true);
+    }
+  }, [bio, xssPatched, bioAttackLogged]);
 
   useEffect(() => {
     const tok = localStorage.getItem("token");
@@ -1227,6 +1279,67 @@ export default function ProfilePage() {
             </div>
           </div>
         )}
+
+        {/* ── Stored XSS Bio Lab ── */}
+        <div style={{ background: isDark ? "#0A0A0A" : "#fff", border: `1.5px solid ${isDark ? "#27272A" : "#e5e7eb"}`, borderRadius: 20, overflow: "hidden", marginBottom: 20 }}>
+          <div style={{ background: isDark ? "#9d174d" : "#9d174d", padding: "16px 28px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              {["#F87171", "#FBBF24", "#4ADE80"].map((c) => <div key={c} style={{ width: 8, height: 8, borderRadius: "50%", background: c }} />)}
+              <span style={{ fontSize: 11, fontWeight: 700, color: "rgba(255,255,255,0.5)", letterSpacing: ".1em", textTransform: "uppercase" as const, marginLeft: 8 }}>Stored XSS — Profile Bio</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, background: "rgba(0,0,0,0.2)", padding: "5px 12px", borderRadius: 20 }}>
+              <div style={{ width: 6, height: 6, borderRadius: "50%", background: xssPatched ? "#4ADE80" : "#F87171" }} />
+              <span style={{ fontSize: 11, fontWeight: 700, color: "rgba(255,255,255,0.6)", letterSpacing: ".04em" }}>{xssPatched ? "PATCHED" : "VULNERABLE"}</span>
+            </div>
+          </div>
+
+          <div style={{ padding: 28 }}>
+            <div style={{ fontSize: 13, color: isDark ? "#a1a1aa" : "#6b7280", lineHeight: 1.6, marginBottom: 20, background: isDark ? "#111" : "#fef9c3", border: `1px solid ${isDark ? "#27272A" : "#fde68a"}`, borderRadius: 10, padding: "12px 16px" }}>
+              <strong style={{ color: isDark ? "#fbbf24" : "#92400e" }}>🧪 Lab:</strong> Set your bio to an XSS payload. When unpatched, it executes via <code style={{ fontSize: 12, background: "rgba(0,0,0,0.07)", padding: "1px 5px", borderRadius: 3 }}>dangerouslySetInnerHTML</code>. When patched, React renders it as a safe text node.
+              <br /><br />
+              <strong>Try:</strong> <code style={{ fontSize: 11, background: "rgba(0,0,0,0.07)", padding: "2px 6px", borderRadius: 3 }}>{`<img src=x onerror="alert('XSS — cookie: '+document.cookie)">`}</code>
+            </div>
+
+            {/* Bio Editor */}
+            {isEditingBio ? (
+              <div>
+                <textarea
+                  value={editBio}
+                  onChange={(e) => setEditBio(e.target.value)}
+                  placeholder={`<img src=x onerror="alert(document.cookie)">`}
+                  rows={3}
+                  style={{ width: "100%", padding: 12, borderRadius: 10, border: `1px solid ${isDark ? "#27272A" : "#e5e7eb"}`, background: isDark ? "#111" : "#f9fafb", color: isDark ? "#ededed" : "#111827", fontSize: 13, fontFamily: "monospace", resize: "vertical" as const, outline: "none" }}
+                />
+                <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                  <button onClick={() => { localStorage.setItem("profile_bio", editBio); setBio(editBio); setIsEditingBio(false); setBioAttackLogged(false); }} style={{ padding: "8px 18px", borderRadius: 8, background: "#111827", color: "#fff", border: "none", fontWeight: 600, fontSize: 13, cursor: "pointer" }}>Save Bio</button>
+                  <button onClick={() => { setIsEditingBio(false); setEditBio(bio); }} style={{ padding: "8px 14px", borderRadius: 8, border: `1px solid ${isDark ? "#27272A" : "#e5e7eb"}`, background: "transparent", color: isDark ? "#ededed" : "#111827", fontWeight: 600, fontSize: 13, cursor: "pointer" }}>Cancel</button>
+                </div>
+              </div>
+            ) : (
+              <div>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: isDark ? "#a1a1aa" : "#374151" }}>Your Bio</span>
+                  <button onClick={() => setIsEditingBio(true)} style={{ fontSize: 12, fontWeight: 600, padding: "5px 12px", borderRadius: 7, border: `1px solid ${isDark ? "#27272A" : "#e5e7eb"}`, background: "transparent", color: isDark ? "#a1a1aa" : "#374151", cursor: "pointer" }}>Edit</button>
+                </div>
+                <div style={{ minHeight: 48, background: isDark ? "#111" : "#f9fafb", border: `1px solid ${detectXssBio(bio) && !xssPatched ? "#fca5a5" : isDark ? "#27272A" : "#e5e7eb"}`, borderRadius: 10, padding: 14 }}>
+                  {bio ? (
+                    xssPatched
+                      ? <span style={{ fontSize: 13, color: isDark ? "#ededed" : "#111827", lineHeight: 1.6 }}>{bio}</span>
+                      : <div dangerouslySetInnerHTML={{ __html: bio }} style={{ fontSize: 13, color: isDark ? "#ededed" : "#111827", lineHeight: 1.6 }} />
+                  ) : (
+                    <span style={{ fontSize: 13, color: isDark ? "#52525b" : "#9ca3af" }}>No bio set — click Edit to add one.</span>
+                  )}
+                </div>
+                {detectXssBio(bio) && (
+                  <div style={{ marginTop: 8, fontSize: 11, fontFamily: "monospace", color: xssPatched ? "#16a34a" : "#ef4444", display: "flex", gap: 5, alignItems: "center" }}>
+                    {xssPatched ? "✅ XSS payload rendered safely as escaped text." : "⚠ XSS payload detected and executing! (dangerouslySetInnerHTML active)"}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
       </main>
 
       <style jsx global>{`

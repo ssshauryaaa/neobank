@@ -5,9 +5,12 @@ export type AttackType =
   | "sqli_search"
   | "idor"
   | "xss"
-  | "sqli_txn" // /api/transactions GET — userId raw interpolation + IDOR
-  | "sqli_txn_insert" // /api/transactions POST — INSERT string concatenation
-  | "xss_txn"; // transactions page — raw JSON / description rendered unsafely
+  | "sqli_txn"         // /api/transactions GET — userId raw interpolation + IDOR
+  | "sqli_txn_insert"  // /api/transactions POST — INSERT string concatenation
+  | "xss_txn"          // transactions page — raw JSON / description rendered unsafely
+  | "open_redirect"    // /redirect?next= — unvalidated external redirect
+  | "xss_profile"      // /profile page — stored XSS via bio rendered as innerHTML
+  | "mass_assignment"; // /api/profile PATCH — accepts role/balance with no whitelist
 export type FilterTab = "all" | "acknowledged" | "fixed";
 export type ChallengeResult = "idle" | "running" | "pass" | "fail";
 
