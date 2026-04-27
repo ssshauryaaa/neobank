@@ -9,14 +9,14 @@ type Props = {
 
 export function ScoreLedger({ scoreHistory }: Props) {
   return (
-    <div style={{ borderTop: "1px solid #1e1e24", flexShrink: 0 }}>
+    <div style={{ borderTop: "1px solid #e2e8f0", flexShrink: 0 }}>
       <div
         style={{
           padding: "11px 22px",
           display: "flex",
           justifyContent: "space-between",
           alignItems: "center",
-          background: "#0d0d10",
+          background: "#f9fafb",
         }}
       >
         <span
@@ -24,12 +24,12 @@ export function ScoreLedger({ scoreHistory }: Props) {
             fontSize: 10,
             fontWeight: 700,
             letterSpacing: ".1em",
-            color: "#3a3a42",
+            color: "#6b7280",
           }}
         >
           PATCH LEDGER
         </span>
-        <span style={{ fontSize: 10, color: "#2a2a30" }}>
+        <span style={{ fontSize: 10, color: "#9ca3af" }}>
           {scoreHistory.length} fixes
         </span>
       </div>
@@ -39,7 +39,7 @@ export function ScoreLedger({ scoreHistory }: Props) {
           <div
             style={{
               padding: "16px 22px",
-              color: "#2a2a30",
+              color: "#9ca3af",
               fontSize: 11,
               textAlign: "center",
             }}
@@ -57,7 +57,7 @@ export function ScoreLedger({ scoreHistory }: Props) {
                   justifyContent: "space-between",
                   alignItems: "center",
                   padding: "10px 22px",
-                  borderBottom: "1px solid #16161a",
+                  borderBottom: "1px solid #e2e8f0",
                 }}
               >
                 <div style={{ flex: 1, minWidth: 0 }}>
@@ -75,7 +75,7 @@ export function ScoreLedger({ scoreHistory }: Props) {
                   <div
                     style={{
                       fontSize: 11,
-                      color: "#4a4a52",
+                      color: "#6b7280",
                       whiteSpace: "nowrap",
                       overflow: "hidden",
                       textOverflow: "ellipsis",
@@ -86,7 +86,7 @@ export function ScoreLedger({ scoreHistory }: Props) {
                   <div
                     style={{
                       fontSize: 10,
-                      color: "#3a3a42",
+                      color: "#9ca3af",
                       marginTop: 2,
                       fontFamily: mono,
                     }}
