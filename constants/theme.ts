@@ -75,6 +75,7 @@ export const TYPE_LABELS: Record<AttackType, string> = {
   open_redirect:    "OPEN REDIRECT",
   xss_profile:      "XSS — PROFILE BIO",
   mass_assignment:  "MASS ASSIGNMENT",
+  ssrf:             "SSRF ATTACK",
 };
 
 export const TYPE_COLORS: Record<
@@ -92,6 +93,7 @@ export const TYPE_COLORS: Record<
   open_redirect:    { text: "#1d4ed8", bg: "#eff6ff", border: "#93c5fd" },
   xss_profile:      { text: "#9d174d", bg: "#fdf2f8", border: "#fbcfe8" },
   mass_assignment:  { text: "#6b21a8", bg: "#faf5ff", border: "#d8b4fe" },
+  ssrf:             { text: "#065f46", bg: "#ecfdf5", border: "#6ee7b7" },
 };
 
 // ── Patch key mapping ─────────────────────────────────────────────────────────
@@ -107,6 +109,7 @@ export const PATCH_KEYS: Record<string, string> = {
   open_redirect:    "patched_open_redirect",
   xss_profile:      "patched_xss_profile",
   mass_assignment:  "patched_mass_assignment",
+  ssrf:             "patched_ssrf",
 };
 
 export const PATCH_TARGET_MAP: Partial<Record<string, string>> = {
@@ -121,4 +124,5 @@ export const PATCH_TARGET_MAP: Partial<Record<string, string>> = {
   open_redirect:    "open_redirect",
   xss_profile:      "xss_profile",
   mass_assignment:  "mass_assignment",
+  ssrf:             "ssrf",
 };

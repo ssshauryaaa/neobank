@@ -10,7 +10,8 @@ export type AttackType =
   | "xss_txn"          // transactions page — raw JSON / description rendered unsafely
   | "open_redirect"    // /redirect?next= — unvalidated external redirect
   | "xss_profile"      // /profile page — stored XSS via bio rendered as innerHTML
-  | "mass_assignment"; // /api/profile PATCH — accepts role/balance with no whitelist
+  | "mass_assignment"  // /api/profile PATCH — accepts role/balance with no whitelist
+  | "ssrf";            // /link-account — server fetches any attacker-supplied URL
 export type FilterTab = "all" | "acknowledged" | "fixed";
 export type ChallengeResult = "idle" | "running" | "pass" | "fail";
 

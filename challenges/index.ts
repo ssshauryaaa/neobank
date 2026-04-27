@@ -13,6 +13,7 @@ import {
   OPEN_REDIRECT_PAGE_STARTER,
   XSS_PROFILE_PAGE_STARTER,
   MASS_ASSIGNMENT_ROUTE_STARTER,
+  SSRF_ROUTE_STARTER,
 } from "@/challenges/starterCode";
 import {
   validateSqliLoginRoute,
@@ -31,6 +32,7 @@ import {
   validateOpenRedirectPage,
   validateXssProfile,
   validateMassAssignment,
+  validateSsrf,
 } from "@/challenges/validators";
 
 export const CHALLENGES: Partial<Record<string, Challenge>> = {
@@ -425,6 +427,25 @@ export async function GET(req: NextRequest) {
       "Remove the debug.updatedFields from the response — it leaks internal SQL structure.",
     ],
     validate: validateMassAssignment,
+  },
+
+  // ── SSRF ──────────────────────────────────────────────────────────────────
+
+  ssrf: {
+    kind: "single",
+    title: "Fix: Server-Side Request Forgery (SSRF) in Account Linker",
+    description:
+      "The POST /api/fetch-url endpoint fetches any URL the client supplies without validation. An attacker can send {\"url\":\"http://localhost:3000/api/debug\"} and the server will fetch and return the full response — exposing internal APIs, env vars, and cloud metadata (e.g. 169.254.169.254). Fix it by validating the URL against a private-IP denylist before fetching.",
+    points: 140,
+    starterCode: SSRF_ROUTE_STARTER,
+    hints: [
+      "Define a denylist of private IP patterns as an array of RegExps:",
+      `const PRIVATE_IP_PATTERNS = [\n  /^https?:\\/\\/localhost/i,\n  /^https?:\\/\\/127\\./,\n  /^https?:\\/\\/10\\./,\n  /^https?:\\/\\/192\\.168\\./,\n  /^https?:\\/\\/169\\.254\\./,\n];`,
+      "Before calling fetch(), check the URL against the denylist and return 403 if it matches:",
+      `const isBlocked = PRIVATE_IP_PATTERNS.some(p => p.test(url));\nif (isBlocked) {\n  return NextResponse.json({ success: false, message: \"Internal URLs are not permitted\" }, { status: 403 });\n}`,
+      "Remove the 🔴 FIX THIS comment block once the check is in place.",
+    ],
+    validate: validateSsrf,
   },
 };
 

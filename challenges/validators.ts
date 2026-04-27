@@ -526,3 +526,18 @@ export function validateMassAssignment(code: string): ValidationResult {
     return { pass: false, feedback: "❌ Remove the debug.updatedFields from the response — it leaks internal state." };
   return { pass: true, feedback: "✅ Fixed! Only allowlisted fields reach the UPDATE query — role/balance are protected." };
 }
+
+// ── SSRF ──────────────────────────────────────────────────────────────────────
+
+export function validateSsrf(code: string): ValidationResult {
+  if (!/PRIVATE_IP_PATTERNS|denyList|denylist|blocklist|BLOCK_LIST|privateIp/i.test(code))
+    return { pass: false, feedback: "❌ Define a PRIVATE_IP_PATTERNS denylist (array of RegExps covering 127.x, 10.x, 192.168.x, 169.254.x)." };
+  if (!/\.some\(|\.test\(|\.includes\(/i.test(code))
+    return { pass: false, feedback: "❌ Test the URL against your denylist patterns before fetching (e.g. patterns.some(p => p.test(url)))." };
+  if (!/403|Forbidden|not permitted|blocked|denied/i.test(code))
+    return { pass: false, feedback: "❌ Return a 403 response when the URL matches a blocked pattern." };
+  if (/\/\/ 🔴 FIX THIS/.test(code))
+    return { pass: false, feedback: "❌ The '🔴 FIX THIS' comment is still present — make sure you've implemented the actual check." };
+  return { pass: true, feedback: "✅ SSRF patched! The server now rejects requests to private/internal IP ranges." };
+}
+

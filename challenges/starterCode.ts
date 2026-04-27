@@ -578,3 +578,44 @@ export async function PATCH(req: NextRequest) {
     debug: { updatedFields: fields },   // 🔴 FIX: remove this debug info
   });
 }`;
+
+// ── SSRF — starter code ───────────────────────────────────────────────────────
+
+export const SSRF_ROUTE_STARTER = `import { NextRequest, NextResponse } from "next/server";
+
+// 🔴 FIX THIS: server fetches any URL the client supplies — no validation at all
+// Exploit: POST /api/fetch-url { "url": "http://localhost:3000/api/debug" }
+// The server will fetch and return the full response, leaking internal data.
+
+// Step 1: Define a private-IP denylist
+const PRIVATE_IP_PATTERNS = [
+  // 🔴 FIX: add patterns here to block private IPs
+  // Example: /^https?:\\/\\/localhost/i,
+  //          /^https?:\\/\\/127\\./,
+  //          /^https?:\\/\\/10\\./,
+  //          /^https?:\\/\\/192\\.168\\./,
+  //          /^https?:\\/\\/169\\.254\\./,   // AWS/GCP metadata endpoint
+];
+
+export async function POST(req: NextRequest) {
+  const body = await req.json();
+  const url = body?.url?.trim();
+  if (!url) return NextResponse.json({ success: false, message: "url is required" }, { status: 400 });
+
+  // 🔴 FIX THIS: check url against PRIVATE_IP_PATTERNS here
+  // const isBlocked = PRIVATE_IP_PATTERNS.some(p => p.test(url));
+  // if (isBlocked) {
+  //   return NextResponse.json({ success: false, message: "Internal URLs are not permitted" }, { status: 403 });
+  // }
+
+  // 🔴 Without the above check, the server fetches ANY URL — including internal ones
+  const upstream = await fetch(url, { headers: { "User-Agent": "NeoBank/1.0 AccountLinker" } });
+  const body2 = await upstream.text();
+
+  return NextResponse.json({
+    success: true,
+    status: upstream.status,
+    body: body2.slice(0, 8000),   // 🔴 FIX: never return raw server responses to the client
+    fetchedUrl: url,
+  });
+}`;
