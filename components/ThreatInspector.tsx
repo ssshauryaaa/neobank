@@ -55,10 +55,10 @@ function ActionButton({
             subColor: "#1a6080",
           }
         : {
-            bg: "#0d0d10",
-            border: "#1e1e24",
-            color: "#3a3a42",
-            subColor: "#2a2a30",
+            bg: "#f8fafc",
+            border: "#e2e8f0",
+            color: "#9ca3af",
+            subColor: "#d1d5db",
           };
 
   return (
@@ -140,7 +140,7 @@ export function ThreatInspector({
           justifyContent: "center",
           flex: 1,
           gap: 12,
-          color: "#2a2a30",
+          color: "#9ca3af",
           textAlign: "center",
           padding: 32,
         }}
@@ -154,24 +154,24 @@ export function ThreatInspector({
         >
           <path
             d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"
-            stroke="#e8e6e1"
+            stroke="#9ca3af"
             strokeWidth="1.5"
             strokeLinecap="round"
             strokeLinejoin="round"
           />
-          <circle cx="12" cy="12" r="2" stroke="#e8e6e1" strokeWidth="1.5" />
+          <circle cx="12" cy="12" r="2" stroke="#9ca3af" strokeWidth="1.5" />
         </svg>
         <div
           style={{
             fontSize: 11,
             fontWeight: 700,
             letterSpacing: ".1em",
-            color: "#2a2a30",
+            color: "#9ca3af",
           }}
         >
           SELECT A THREAT
         </div>
-        <div style={{ fontSize: 11, color: "#2a2a30" }}>
+        <div style={{ fontSize: 11, color: "#9ca3af" }}>
           Click any log row to inspect
         </div>
       </div>
@@ -196,8 +196,9 @@ export function ThreatInspector({
       {/* Threat card */}
       <div
         style={{
-          background: "#16161a",
-          border: `1px solid ${sev.dot}22`,
+          background: "#ffffff",
+          border: `1px solid ${sev.dot}44`,
+          boxShadow: "0 4px 6px -1px rgba(0,0,0,0.05)",
           borderRadius: 10,
           overflow: "hidden",
         }}
@@ -267,7 +268,7 @@ export function ThreatInspector({
           <div
             style={{
               fontSize: 12,
-              color: "#8b8480",
+              color: "#6b7280",
               lineHeight: 1.65,
               marginBottom: 14,
             }}
@@ -281,7 +282,8 @@ export function ThreatInspector({
               display: "grid",
               gridTemplateColumns: "1fr 1fr",
               gap: 8,
-              background: "#0d0d10",
+              background: "#f9fafb",
+              border: "1px solid #e2e8f0",
               borderRadius: 7,
               padding: 12,
               marginBottom: 12,
@@ -299,7 +301,7 @@ export function ThreatInspector({
                 <div
                   style={{
                     fontSize: 9,
-                    color: "#3a3a42",
+                    color: "#9ca3af",
                     fontWeight: 700,
                     letterSpacing: ".08em",
                     marginBottom: 3,
@@ -310,7 +312,7 @@ export function ThreatInspector({
                 <div
                   style={{
                     fontSize: 11,
-                    color: "#a0998f",
+                    color: "#374151",
                     wordBreak: "break-all",
                     fontFamily: l === "SOURCE IP" ? mono : sans,
                   }}
@@ -324,7 +326,7 @@ export function ThreatInspector({
           <div
             style={{
               fontSize: 9,
-              color: "#3a3a42",
+              color: "#9ca3af",
               fontWeight: 700,
               letterSpacing: ".08em",
               marginBottom: 5,
@@ -334,12 +336,12 @@ export function ThreatInspector({
           </div>
           <div
             style={{
-              background: "#0d0d10",
-              border: "1px solid #1e1e24",
+              background: "#f9fafb",
+              border: "1px solid #e2e8f0",
               borderRadius: 6,
               padding: "10px 12px",
               fontSize: 11,
-              color: "#6b6b70",
+              color: "#4b5563",
               whiteSpace: "pre-wrap",
               wordBreak: "break-all",
               lineHeight: 1.7,
@@ -457,7 +459,7 @@ export function ThreatInspector({
         <div
           style={{
             fontSize: 9,
-            color: "#2a2a30",
+            color: "#9ca3af",
             fontWeight: 700,
             letterSpacing: ".1em",
             marginBottom: 5,
@@ -468,7 +470,7 @@ export function ThreatInspector({
         <div
           style={{
             fontSize: 10,
-            color: "#4a4a52",
+            color: "#6b7280",
             fontFamily: mono,
             lineHeight: 1.6,
             wordBreak: "break-all",

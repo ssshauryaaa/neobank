@@ -32,19 +32,19 @@ export function LogRow({ log, isSelected, patchedTypes, onSelect }: Props) {
         gridTemplateColumns: "88px 82px 150px 1fr 110px",
         alignItems: "center",
         padding: "11px 24px",
-        borderBottom: "1px solid #16161a",
+        borderBottom: "1px solid #e2e8f0",
         borderLeft: `3px solid ${isSelected ? sev.dot : "transparent"}`,
         background: isSelected
-          ? "#141418"
+          ? "#f1f5f9"
           : hovered
-            ? "#111115"
+            ? "#f8fafc"
             : "transparent",
         cursor: "pointer",
         opacity: isGP ? 0.35 : 1,
         transition: "background .1s",
       }}
     >
-      <span style={{ fontSize: 11, color: "#4a4a52", fontFamily: mono }}>
+      <span style={{ fontSize: 11, color: "#9ca3af", fontFamily: mono }}>
         {fmtTime(log.ts)}
       </span>
 
@@ -90,7 +90,7 @@ export function LogRow({ log, isSelected, patchedTypes, onSelect }: Props) {
       <div
         style={{
           fontSize: 12,
-          color: "#6b6b70",
+          color: "#6b7280",
           whiteSpace: "nowrap",
           overflow: "hidden",
           textOverflow: "ellipsis",
