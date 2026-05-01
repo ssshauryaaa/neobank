@@ -6,3 +6,8 @@ export { LogRow } from "./LogRow";
 export * from "./ThreatInspector";
 export * from "./VulnerabilityScanner";
 export { ScoreLedger } from "./ScoreLedger";
+export { LogsTab }        from "./defense/LogsTab";
+export { InvestigateTab } from "./defense/InvestigateTab";
+export { ScanTab }        from "./defense/ScanTab";
+export { ToolsTab }       from "./defense/ToolsTab";
+export { CodebaseTab }    from "./defense/CodebaseTab";

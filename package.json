@@ -13,6 +13,7 @@
     "cookies-next": "^4.1.1",
     "jose": "^6.2.2",
     "jsonwebtoken": "^9.0.2",
+    "lucide-react": "^1.14.0",
     "mysql2": "^3.6.0",
     "next": "14.0.0",
     "react": "^18",

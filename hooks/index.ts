@@ -44,9 +44,8 @@ export function useToast() {
 
 // ── useAttackSimulator ────────────────────────────────────────────────────────
 
-export function useAttackSimulator(
+export function useAttackLogger(
   patchedTypes: Set<AttackType>,
-  isRunning: boolean,
 ) {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [alertFlash, setAlertFlash] = useState(false);
@@ -70,25 +69,6 @@ export function useAttackSimulator(
     [flash],
   );
 
-  const spawnAttack = useCallback(() => {
-    const available = ATTACK_TEMPLATES.filter(
-      (t) => !patchedRef.current.has(t.type),
-    );
-    if (!available.length) return;
-    const tpl = available[rnd(0, available.length)];
-    addLog({
-      ...tpl,
-      id: uid(),
-      ts: Date.now(),
-      ip: fakeIp(),
-      port: fakePort(),
-      country: COUNTRIES[rnd(0, COUNTRIES.length)],
-      userAgent: USER_AGENTS[rnd(0, USER_AGENTS.length)],
-      patched: false,
-      detected: false,
-    });
-  }, [addLog]);
-
   // Poll real attacks written by the app's login/search/transactions pages
   useEffect(() => {
     const poll = setInterval(() => {
@@ -111,14 +91,6 @@ export function useAttackSimulator(
     }, 600);
     return () => clearInterval(poll);
   }, [addLog]);
-
-  // Periodic simulated attack spawn
-  useEffect(() => {
-    if (!isRunning) return;
-    spawnAttack();
-    const t = setInterval(spawnAttack, 6000);
-    return () => clearInterval(t);
-  }, [isRunning, spawnAttack]);
 
   return { logs, setLogs, alertFlash };
 }
